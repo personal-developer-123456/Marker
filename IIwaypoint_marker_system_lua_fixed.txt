@@ -1,0 +1,2521 @@
+--[[
+===============================================================================
+  WAYPOINT & MARKER SYSTEM
+  Client-side only | single file | made for Roblox script executors
+===============================================================================
+  WHAT IT DOES
+    * Place markers by tapping / clicking the map. Each marker raycasts to the
+      surface it hit and sticks to it (and follows it if that surface moves).
+      If the surface is removed or stops being "the map", the marker vanishes.
+    * Any marker can be the active waypoint: world beam + arrow, a screen-edge
+      arrow when it is off-screen, and a live distance readout.
+    * Markers, the waypoint and your settings are saved per game (PlaceId) when
+      the executor has file functions. If not, everything stays in memory and
+      the UI tells you so.
+
+  CONTROLS
+    Touch   : Place -> clean tap on the map. Long-press a marker (list row, or
+              the pin in the world) -> tap the map to move it.
+    Mouse   : same as touch, or hover + [P] to place instantly.
+              [RightShift] minimizes / restores the panel.
+    Gamepad : [R3] places at the crosshair, [L3] focuses the panel.
+
+  SECTIONS
+    1 Config        2 Bootstrap     3 Utilities     4 State
+    5 Storage       6 Map           7 World         8 Markers
+    9 UI           10 Input        11 App (start / step / unload)
+===============================================================================
+]]
+
+--==============================================================================
+-- 1. CONFIG  (edit freely; most of these can also be changed live in Settings)
+--==============================================================================
+local CONFIG = {
+    -- Saving ------------------------------------------------------------------
+    SaveEnabled     = true,              -- auto save/load markers + waypoint
+    SaveFolder      = "WaypointMarkers", -- folder inside the executor workspace
+    SaveDebounce    = 1.0,               -- seconds to wait after a change before writing
+    PersistSettings = true,              -- remember Settings-UI changes (they override these defaults)
+
+    -- Markers -----------------------------------------------------------------
+    MaxMarkers        = 30,
+    MarkerStyle       = "A",   -- "A" = visible everywhere (through walls, any distance)
+                               -- "B" = only visible near its point
+    FadeDistance      = 150,   -- Mode B: marker is fully gone at this distance (studs)
+    FadeStartFrac     = 0.6,   -- Mode B: fading starts at FadeDistance * this
+    ModeBThroughWalls = false, -- Mode B: also show through walls while near?
+    MarkerScale       = 1.0,
+    PinHeight         = 2.5,   -- studs the pin floats above the surface
+    Icon              = "\226\150\188", -- pin glyph (a down triangle); any text works
+    IconImage         = "",    -- optional "rbxassetid://..." (overrides Icon)
+    NamePrefix        = "Marker",
+    CycleColors       = true,  -- give each new marker the next palette color
+    DefaultColor      = Color3.fromRGB(255, 85, 85),
+    Palette = {
+        Color3.fromRGB(255, 85, 85),   Color3.fromRGB(255, 150, 60),
+        Color3.fromRGB(250, 210, 60),  Color3.fromRGB(80, 210, 120),
+        Color3.fromRGB(60, 200, 230),  Color3.fromRGB(80, 130, 255),
+        Color3.fromRGB(170, 110, 255), Color3.fromRGB(255, 110, 190),
+    },
+
+    -- Active waypoint ---------------------------------------------------------
+    Waypoint = {
+        Guide             = "both", -- "beam" | "arrow" | "both" | "none"
+        EdgeIndicator     = true,   -- screen-edge arrow when off-screen
+        BeamWidth         = 0.6,
+        BeamTexture       = "",     -- optional "rbxassetid://..." for a scrolling beam
+        ArrowDistance     = 5,      -- studs in front of you the world arrow floats
+        ArriveDistance    = 10,     -- studs that count as "arrived"
+        AutoClearOnArrive = false,
+        ForcePinVisible   = true,   -- the active waypoint's pin ignores Mode B fading
+    },
+
+    -- What counts as "the map" ------------------------------------------------
+    Map = {
+        Mode             = "Auto",   -- "Auto"       anchored parts + Terrain (not characters)
+                                     -- "Everything" any part + Terrain (not characters)
+                                     -- "Folder"     only inside Workspace.<FolderName>
+                                     -- "Tag"        only parts (or ancestors) with CollectionService tag <Tag>
+        FolderName       = "Map",    -- dots/slashes allowed for nesting: "World.Map"
+        Tag              = "MapSurface",
+        IgnoreInvisible  = true,     -- invisible parts (Transparency >= 0.99) are not map
+        MaxPlaceDistance = 3000,     -- max ray length when placing (studs)
+        ValidateInterval = 0.5,      -- seconds between "is it still on the map?" checks
+        ValidateRadius   = 250,      -- with StreamingEnabled: only check markers this close
+        LoadGraceSeconds = 10,       -- how long a freshly loaded marker may wait for its surface
+    },
+
+    Units = "m", -- "m" (1 stud = 0.28 m) or "studs"
+
+    -- Input -------------------------------------------------------------------
+    Input = {
+        TapMaxMove      = 12,   -- px a finger may move and still count as a tap
+        TapMaxTime      = 0.45, -- seconds a press may last and still count as a tap
+        LongPressTime   = 0.6,  -- seconds to hold before a long-press fires
+        GrabRadius      = 64,   -- px around a world pin that a long-press can grab
+        StickyPlace     = false,-- stay in placing mode after each marker
+        PlaceKey        = Enum.KeyCode.P,
+        ToggleKey       = Enum.KeyCode.RightShift,
+        GamepadPlaceKey = Enum.KeyCode.ButtonR3,
+        GamepadMenuKey  = Enum.KeyCode.ButtonL3,
+        GamepadReticle  = true, -- show a crosshair while using a gamepad
+    },
+
+    -- Panel / HUD -------------------------------------------------------------
+    UI = {
+        Scale              = 1.0,  -- extra scale on top of the automatic one (never below 1)
+        ButtonHeight       = 48,   -- minimum 44 is enforced
+        PanelWidth         = 340,
+        PanelHeight        = 460,
+        Position           = { X = 1, Y = 0 }, -- 0..1 of the free room: (1,0) = top-right
+        StartMinimized     = false,
+        AvoidRobloxButtons = true, -- keep clear of the jump button / thumbstick on touch
+    },
+
+    Colors = {
+        Panel       = Color3.fromRGB(23, 25, 32),
+        Header      = Color3.fromRGB(33, 36, 46),
+        Row         = Color3.fromRGB(36, 40, 51),
+        RowSelected = Color3.fromRGB(50, 58, 78),
+        Button      = Color3.fromRGB(48, 53, 68),
+        Accent      = Color3.fromRGB(66, 120, 235),
+        Danger      = Color3.fromRGB(200, 60, 60),
+        Good        = Color3.fromRGB(60, 170, 105),
+        Warn        = Color3.fromRGB(230, 170, 60),
+        Text        = Color3.fromRGB(240, 242, 248),
+        SubText     = Color3.fromRGB(160, 168, 185),
+        Stroke      = Color3.fromRGB(70, 76, 95),
+    },
+}
+
+-- Glyphs as UTF-8 byte escapes so the file survives any executor's text handling
+local GLYPH = {
+    star     = "\226\152\133", -- filled star
+    arrow    = "\226\150\178", -- up triangle
+    close    = "\226\156\149", -- x mark
+    minimize = "\226\128\148", -- long dash
+    expand   = "\226\150\161", -- open square
+    bullet   = "\226\128\162",
+}
+
+-- Settings shown in the Settings page (also the list of values that are persisted)
+local SCHEMA = {
+    { path = "MarkerStyle", kind = "choice", label = "Marker style (all markers)",
+      options = { { "A", "Always visible" }, { "B", "Near only" } } },
+    { path = "FadeDistance", kind = "stepper", label = "Near radius (studs)", min = 25, max = 2000, step = 25 },
+    { path = "MarkerScale", kind = "stepper", label = "Marker size", min = 0.5, max = 2.5, step = 0.1 },
+    { path = "Waypoint.Guide", kind = "choice", label = "World guide",
+      options = { { "both", "Beam + arrow" }, { "beam", "Beam" }, { "arrow", "Arrow" }, { "none", "Off" } } },
+    { path = "Waypoint.EdgeIndicator", kind = "toggle", label = "Screen-edge arrow" },
+    { path = "Waypoint.AutoClearOnArrive", kind = "toggle", label = "Clear waypoint on arrival" },
+    { path = "Units", kind = "choice", label = "Distance units",
+      options = { { "m", "Meters" }, { "studs", "Studs" } } },
+    { path = "Input.StickyPlace", kind = "toggle", label = "Keep placing after a tap" },
+    { path = "CycleColors", kind = "toggle", label = "Auto-cycle marker colors" },
+    { path = "MaxMarkers", kind = "stepper", label = "Max markers", min = 1, max = 100, step = 5 },
+    { path = "SaveEnabled", kind = "toggle", label = "Auto-save markers" },
+    { path = "Map.Mode", kind = "choice", label = "Map surfaces", map = true,
+      options = { { "Auto", "Auto (anchored)" }, { "Everything", "Everything" }, { "Folder", "Folder" }, { "Tag", "Tag" } } },
+    { path = "Map.FolderName", kind = "text", label = "Map folder (Folder mode)", map = true },
+    { path = "Map.Tag", kind = "text", label = "Map tag (Tag mode)", map = true },
+    { path = "UI.Scale", kind = "stepper", label = "UI scale", min = 1, max = 1.6, step = 0.1 },
+}
+
+--==============================================================================
+-- 2. BOOTSTRAP: services, executor feature detection, double-run guard
+--==============================================================================
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local GuiService        = game:GetService("GuiService")
+local HttpService       = game:GetService("HttpService")
+local CollectionService = game:GetService("CollectionService")
+local Workspace         = game:GetService("Workspace")
+
+if not game:IsLoaded() then
+    pcall(function() game.Loaded:Wait() end)
+end
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    pcall(function() Players:GetPropertyChangedSignal("LocalPlayer"):Wait() end)
+    LocalPlayer = Players.LocalPlayer
+end
+if not LocalPlayer then
+    warn("[WPM] No LocalPlayer found - aborting.")
+    return
+end
+
+local SHARED_KEY = "__WaypointMarkerSystem_v1"
+local ATTR = "WPM_System" -- attribute stamped on everything we create (orphan sweep)
+
+-- Look a global up safely (executors expose functions through different envs)
+local function lookupGlobal(name)
+    local ok, v = pcall(function() return getgenv()[name] end)
+    if ok and v ~= nil then return v end
+    ok, v = pcall(function() return getfenv()[name] end)
+    if ok and v ~= nil then return v end
+    return nil
+end
+
+local function lookupFunction(name)
+    local v = lookupGlobal(name)
+    if type(v) == "function" then return v end
+    return nil
+end
+
+local Exec = {
+    gethui    = lookupFunction("gethui"),
+    writefile = lookupFunction("writefile"),
+    readfile  = lookupFunction("readfile"),
+    isfile    = lookupFunction("isfile"),
+    makefolder = lookupFunction("makefolder"),
+    isfolder  = lookupFunction("isfolder"),
+    protectgui = lookupFunction("protectgui"),
+}
+if not Exec.protectgui then
+    local syn = lookupGlobal("syn")
+    if type(syn) == "table" and type(syn.protect_gui) == "function" then
+        Exec.protectgui = syn.protect_gui
+    end
+end
+Exec.canFiles = Exec.writefile ~= nil and Exec.readfile ~= nil and Exec.isfile ~= nil
+
+-- Shared table used to find (and unload) a previous run of this script
+local function sharedTable()
+    local ok, genv = pcall(function() return getgenv() end)
+    if ok and type(genv) == "table" then return genv end
+    return _G
+end
+local Shared = sharedTable()
+
+do
+    local prev = Shared[SHARED_KEY]
+    if type(prev) == "table" and type(prev.Unload) == "function" then
+        pcall(prev.Unload)
+    end
+    Shared[SHARED_KEY] = nil
+end
+
+-- Destroy leftovers from a run whose Unload failed or never registered
+local function sweepOrphans()
+    local containers = {}
+    if Exec.gethui then
+        local ok, h = pcall(Exec.gethui)
+        if ok and typeof(h) == "Instance" then containers[#containers + 1] = h end
+    end
+    pcall(function() containers[#containers + 1] = game:GetService("CoreGui") end)
+    pcall(function()
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if pg then containers[#containers + 1] = pg end
+    end)
+    containers[#containers + 1] = Workspace
+    for _, c in ipairs(containers) do
+        local ok, kids = pcall(function() return c:GetChildren() end)
+        if ok then
+            for _, k in ipairs(kids) do
+                local okA, tagged = pcall(function() return k:GetAttribute(ATTR) end)
+                if okA and tagged then pcall(function() k:Destroy() end) end
+            end
+        end
+    end
+end
+
+--==============================================================================
+-- 3. UTILITIES: janitor, config paths, small helpers, UI factories
+--==============================================================================
+local Janitor = {}
+Janitor.__index = Janitor
+
+local function cleanItem(item)
+    local kind = typeof(item)
+    if kind == "RBXScriptConnection" then
+        pcall(function() item:Disconnect() end)
+    elseif kind == "Instance" then
+        pcall(function() item:Destroy() end)
+    elseif kind == "function" then
+        pcall(item)
+    end
+end
+
+function Janitor.new()
+    return setmetatable({ items = {}, dead = false }, Janitor)
+end
+function Janitor:Add(item)
+    if self.dead then cleanItem(item) return item end
+    self.items[#self.items + 1] = item
+    return item
+end
+function Janitor:Connect(signal, callback)
+    return self:Add(signal:Connect(callback))
+end
+function Janitor:Clean()
+    local items = self.items
+    self.items = {}
+    for i = #items, 1, -1 do cleanItem(items[i]) end
+end
+function Janitor:Destroy()
+    self.dead = true
+    self:Clean()
+end
+
+local Main   = Janitor.new() -- everything permanent
+local RowJan = Janitor.new() -- connections of the rebuilt marker list rows
+Main:Add(function() RowJan:Destroy() end)
+
+-- "A.B.C" path access into CONFIG
+local function cfgGet(path)
+    local t = CONFIG
+    for key in string.gmatch(path, "[^%.]+") do
+        if type(t) ~= "table" then return nil end
+        t = t[key]
+    end
+    return t
+end
+local function cfgSet(path, value)
+    local keys = {}
+    for key in string.gmatch(path, "[^%.]+") do keys[#keys + 1] = key end
+    local t = CONFIG
+    for i = 1, #keys - 1 do t = t[keys[i]] end
+    t[keys[#keys]] = value
+end
+
+local DEFAULTS = {}
+for _, entry in ipairs(SCHEMA) do DEFAULTS[entry.path] = cfgGet(entry.path) end
+
+local C = CONFIG.Colors
+local FONT, FONT_BOLD = Enum.Font.GothamMedium, Enum.Font.GothamBold
+local ALIGN_L, ALIGN_C, ALIGN_R = Enum.TextXAlignment.Left, Enum.TextXAlignment.Center, Enum.TextXAlignment.Right
+
+local function randomName()
+    local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    local out = {}
+    for i = 1, 12 do
+        local k = math.random(1, #chars)
+        out[i] = chars:sub(k, k)
+    end
+    return table.concat(out)
+end
+
+local function genId()
+    local ok, id = pcall(function() return HttpService:GenerateGUID(false) end)
+    if ok and type(id) == "string" then
+        return (id:gsub("%-", "")):sub(1, 10)
+    end
+    return tostring(math.random(100000000, 999999999))
+end
+
+local function trim(s)
+    return ((tostring(s):gsub("^%s+", "")):gsub("%s+$", ""))
+end
+
+local function round3(n) return math.floor(n * 1000 + 0.5) / 1000 end
+
+local function sameColor(a, b)
+    return math.abs(a.R - b.R) + math.abs(a.G - b.G) + math.abs(a.B - b.B) < 0.02
+end
+
+local function colorToArr(c)
+    return { math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5) }
+end
+local function arrToColor(a, fallback)
+    if type(a) == "table" and type(a[1]) == "number" and type(a[2]) == "number" and type(a[3]) == "number" then
+        return Color3.fromRGB(math.clamp(a[1], 0, 255), math.clamp(a[2], 0, 255), math.clamp(a[3], 0, 255))
+    end
+    return fallback
+end
+local function v3ToArr(v) return { round3(v.X), round3(v.Y), round3(v.Z) } end
+local function arrToV3(a)
+    if type(a) == "table" and type(a[1]) == "number" and type(a[2]) == "number" and type(a[3]) == "number" then
+        return Vector3.new(a[1], a[2], a[3])
+    end
+    return nil
+end
+
+local function formatDistance(studs)
+    if CONFIG.Units == "studs" then
+        if studs >= 1000 then return string.format("%.1fk studs", studs / 1000) end
+        return string.format("%d studs", math.floor(studs + 0.5))
+    end
+    local m = studs * 0.28
+    if m >= 1000 then return string.format("%.2f km", m / 1000) end
+    if m >= 100 then return string.format("%d m", math.floor(m + 0.5)) end
+    return string.format("%.1f m", m)
+end
+
+local function getRoot()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+end
+
+local function getFocusPos()
+    local root = getRoot()
+    if root then return root.Position end
+    local cam = Workspace.CurrentCamera
+    if cam then return cam.CFrame.Position end
+    return Vector3.new(0, 0, 0)
+end
+
+-- UI factories -----------------------------------------------------------------
+local function create(className, props, parent)
+    local inst = Instance.new(className)
+    for k, v in pairs(props) do inst[k] = v end
+    if parent then inst.Parent = parent end
+    return inst
+end
+local function addCorner(inst, radius)
+    return create("UICorner", { CornerRadius = UDim.new(0, radius) }, inst)
+end
+local function addStroke(inst, color, thickness, transparency)
+    return create("UIStroke", {
+        Color = color, Thickness = thickness or 1, Transparency = transparency or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, inst)
+end
+local function addPadding(inst, l, t, r, b)
+    return create("UIPadding", {
+        PaddingLeft = UDim.new(0, l), PaddingTop = UDim.new(0, t or l),
+        PaddingRight = UDim.new(0, r or l), PaddingBottom = UDim.new(0, b or t or l),
+    }, inst)
+end
+local function addList(inst, dir, pad)
+    return create("UIListLayout", {
+        FillDirection = dir or Enum.FillDirection.Vertical,
+        Padding = UDim.new(0, pad or 0),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, inst)
+end
+local function label(parent, props)
+    local p = {
+        BackgroundTransparency = 1, BorderSizePixel = 0, Font = FONT, Text = "",
+        TextColor3 = C.Text, TextSize = 14, TextXAlignment = ALIGN_L,
+    }
+    for k, v in pairs(props) do p[k] = v end
+    return create("TextLabel", p, parent)
+end
+local function button(parent, props, onClick, jan)
+    local p = {
+        AutoButtonColor = true, BackgroundColor3 = C.Button, BorderSizePixel = 0,
+        Font = FONT_BOLD, Text = "", TextColor3 = C.Text, TextSize = 14,
+    }
+    for k, v in pairs(props) do p[k] = v end
+    local b = create("TextButton", p, parent)
+    addCorner(b, 8)
+    if onClick then
+        (jan or Main):Connect(b.Activated, function() onClick() end)
+    end
+    return b
+end
+
+--==============================================================================
+-- 4. STATE
+--==============================================================================
+local State = {
+    markers    = {},   -- id -> marker
+    order      = {},   -- ordered list of markers
+    counter    = 0,    -- used for default names
+    selectedId = nil,
+    activeId   = nil,  -- the active waypoint
+    mode       = "idle", -- "idle" | "place" | "move"
+    movingId   = nil,
+    unloaded   = false,
+    lastInput  = UserInputService:GetLastInputType(),
+    minimized  = CONFIG.UI.StartMinimized,
+    holdUntil  = 0,    -- validation is paused until this time (after map rule changes)
+    mapMissing = false,
+    mapMsg     = "",
+    arrived    = false,
+}
+
+-- Forward declarations: modules are plain tables filled in below
+local Store, Map, World, Markers, UI, Input, App = {}, {}, {}, {}, {}, {}, {}
+
+--==============================================================================
+-- 5. STORAGE (writefile / readfile, JSON, per PlaceId) with in-memory fallback
+--==============================================================================
+Store.filesOK   = Exec.canFiles
+Store.useFolder = false
+Store.failures  = 0
+Store.lastError = nil
+Store.dirty     = false
+Store.nextSaveAt = 0
+Store.settingsDirty = false
+Store.settingsAt = 0
+
+function Store.init()
+    if not Store.filesOK then return end
+    if Exec.makefolder then
+        local need = true
+        if Exec.isfolder then
+            local okE, exists = pcall(Exec.isfolder, CONFIG.SaveFolder)
+            if okE and exists then need = false; Store.useFolder = true end
+        end
+        if need then
+            local okM = pcall(Exec.makefolder, CONFIG.SaveFolder)
+            Store.useFolder = okM
+        end
+    end
+end
+
+function Store.path(name)
+    if Store.useFolder then return CONFIG.SaveFolder .. "/" .. name end
+    return CONFIG.SaveFolder .. "_" .. name
+end
+
+local function markersFile() return "markers_" .. tostring(game.PlaceId) .. ".json" end
+
+local function writeText(name, text)
+    local ok, err = pcall(Exec.writefile, Store.path(name), text)
+    if not ok and Store.useFolder then
+        Store.useFolder = false -- folder trouble: retry in the flat layout once
+        ok, err = pcall(Exec.writefile, Store.path(name), text)
+    end
+    return ok, err
+end
+
+local function readText(name)
+    local path = Store.path(name)
+    local okE, exists = pcall(Exec.isfile, path)
+    if not okE or not exists then return nil, nil end
+    local ok, raw = pcall(Exec.readfile, path)
+    if not ok or type(raw) ~= "string" then return nil, tostring(raw) end
+    return raw, nil
+end
+
+function Store.fail(err)
+    Store.failures = Store.failures + 1
+    Store.lastError = tostring(err)
+    Store.nextSaveAt = os.clock() + math.min(30, 3 * Store.failures) -- back off, keep dirty
+    if Store.failures == 1 then
+        UI.toast("Save failed: " .. Store.lastError, "error", 5)
+    end
+    UI.refreshStatus()
+end
+
+function Store.markDirty()
+    Store.dirty = true
+    Store.nextSaveAt = os.clock() + CONFIG.SaveDebounce
+    UI.refreshStatus()
+end
+
+function Store.markSettingsDirty()
+    Store.settingsDirty = true
+    Store.settingsAt = os.clock() + 1.0
+end
+
+function Store.saveMarkers()
+    if not (Store.filesOK and CONFIG.SaveEnabled) then Store.dirty = false return true end
+    local list = {}
+    for _, m in ipairs(State.order) do
+        list[#list + 1] = {
+            id = m.id, name = m.name, color = colorToArr(m.color),
+            pos = v3ToArr(m.pos), normal = v3ToArr(m.normal), style = m.style,
+        }
+    end
+    local payload = { v = 1, placeId = game.PlaceId, counter = State.counter, active = State.activeId, markers = list }
+    local okJ, text = pcall(function() return HttpService:JSONEncode(payload) end)
+    if not okJ then Store.fail("encode: " .. tostring(text)) return false end
+    local ok, err = writeText(markersFile(), text)
+    if not ok then Store.fail(err) return false end
+    Store.failures, Store.lastError, Store.dirty = 0, nil, false
+    UI.refreshStatus()
+    return true
+end
+
+function Store.saveSettings()
+    Store.settingsDirty = false
+    if not (Store.filesOK and CONFIG.PersistSettings) then return true end
+    local values = {}
+    for _, entry in ipairs(SCHEMA) do values[entry.path] = cfgGet(entry.path) end
+    local payload = {
+        v = 1, values = values,
+        ui = { x = CONFIG.UI.Position.X, y = CONFIG.UI.Position.Y, minimized = State.minimized,
+               w = CONFIG.UI.PanelWidth, h = CONFIG.UI.PanelHeight },
+    }
+    local okJ, text = pcall(function() return HttpService:JSONEncode(payload) end)
+    if not okJ then return false end
+    local ok, err = writeText("settings.json", text)
+    if not ok then Store.fail(err) return false end
+    return true
+end
+
+function Store.loadSettings()
+    if not (Store.filesOK and CONFIG.PersistSettings) then return end
+    local raw = readText("settings.json")
+    if not raw then return end
+    local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok or type(data) ~= "table" then return end
+    if type(data.values) == "table" then
+        for _, entry in ipairs(SCHEMA) do
+            local v, cur = data.values[entry.path], cfgGet(entry.path)
+            if v ~= nil and type(v) == type(cur) then cfgSet(entry.path, v) end
+        end
+    end
+    if type(data.ui) == "table" then
+        if type(data.ui.x) == "number" then CONFIG.UI.Position.X = math.clamp(data.ui.x, 0, 1) end
+        if type(data.ui.y) == "number" then CONFIG.UI.Position.Y = math.clamp(data.ui.y, 0, 1) end
+        if type(data.ui.minimized) == "boolean" then State.minimized = data.ui.minimized end
+        if type(data.ui.w) == "number" then CONFIG.UI.PanelWidth = math.clamp(data.ui.w, 260, 1200) end
+        if type(data.ui.h) == "number" then
+            CONFIG.UI.PanelHeight = math.clamp(data.ui.h, 240, 1200)
+            UI.userSized = true
+        end
+    end
+end
+
+function Store.loadMarkers()
+    if not (Store.filesOK and CONFIG.SaveEnabled) then return 0 end
+    local raw, rerr = readText(markersFile())
+    if not raw then
+        if rerr then Store.fail("read: " .. rerr) end
+        return 0
+    end
+    local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok or type(data) ~= "table" or type(data.markers) ~= "table" then
+        UI.toast("Saved markers were unreadable and were skipped", "warn", 4)
+        return 0
+    end
+    State.counter = tonumber(data.counter) or 0
+    local n = 0
+    for _, entry in ipairs(data.markers) do
+        if n >= CONFIG.MaxMarkers then break end
+        if type(entry) == "table" and Markers.restore(entry) then n = n + 1 end
+    end
+    if type(data.active) == "string" and State.markers[data.active] then
+        Markers.setActive(data.active)
+    end
+    UI.refreshList()
+    return n
+end
+
+function Store.tick(now)
+    if Store.dirty and Store.filesOK and CONFIG.SaveEnabled and now >= Store.nextSaveAt then
+        Store.saveMarkers()
+    end
+    if Store.settingsDirty and now >= Store.settingsAt then
+        Store.saveSettings()
+    end
+end
+
+function Store.flush()
+    if Store.dirty then Store.saveMarkers() end
+    if Store.settingsDirty then Store.saveSettings() end
+end
+
+--==============================================================================
+-- 6. MAP: what counts as the map, raycasting, surface checks
+--==============================================================================
+local EXCLUDE = Enum.RaycastFilterType.Exclude
+local INCLUDE = Enum.RaycastFilterType.Include
+do -- older clients only know the deprecated names
+    local okE = pcall(function() return Enum.RaycastFilterType.Exclude end)
+    if not okE then
+        EXCLUDE = Enum.RaycastFilterType.Blacklist
+        INCLUDE = Enum.RaycastFilterType.Whitelist
+    end
+end
+
+local function isInsideCharacter(inst)
+    local cur = inst
+    while cur and cur ~= Workspace do
+        if cur:IsA("Model") and cur:FindFirstChildOfClass("Humanoid") then return true end
+        cur = cur.Parent
+    end
+    return false
+end
+
+local function hasTagUp(inst, tag)
+    local cur = inst
+    while cur and cur ~= Workspace do
+        if CollectionService:HasTag(cur, tag) then return true end
+        cur = cur.Parent
+    end
+    return false
+end
+
+function Map.getRoot()
+    local name = CONFIG.Map.FolderName
+    if type(name) ~= "string" or name == "" then return nil end
+    local cur = Workspace
+    for part in string.gmatch(name, "[^%./]+") do
+        cur = cur:FindFirstChild(part)
+        if not cur then return nil end
+    end
+    return cur
+end
+
+-- Is this instance part of "the map" under the current rule?
+function Map.isMap(inst)
+    if not inst or not inst.Parent then return false end
+    if World.folder and (inst == World.folder or inst:IsDescendantOf(World.folder)) then return false end
+    local isTerrain = inst:IsA("Terrain")
+    if not isTerrain and not inst:IsA("BasePart") then return false end
+    if not inst:IsDescendantOf(Workspace) then return false end
+    if CONFIG.Map.IgnoreInvisible and not isTerrain and inst.Transparency >= 0.99 then return false end
+    if isInsideCharacter(inst) then return false end
+    local mode = CONFIG.Map.Mode
+    if mode == "Everything" then
+        return true
+    elseif mode == "Folder" then
+        local root = Map.getRoot()
+        return root ~= nil and (inst == root or inst:IsDescendantOf(root))
+    elseif mode == "Tag" then
+        return hasTagUp(inst, CONFIG.Map.Tag)
+    end
+    -- "Auto": static world geometry
+    if isTerrain then return true end
+    return inst.Anchored
+end
+
+-- Can we judge markers / place new ones at all? (missing folder, empty tag...)
+function Map.available()
+    local mode = CONFIG.Map.Mode
+    if mode == "Folder" and not Map.getRoot() then
+        return false, "Map folder '" .. tostring(CONFIG.Map.FolderName) .. "' not found - markers kept, placing paused"
+    end
+    if mode == "Tag" then
+        local ok, tagged = pcall(function() return CollectionService:GetTagged(CONFIG.Map.Tag) end)
+        if not ok or #tagged == 0 then
+            return false, "No parts tagged '" .. tostring(CONFIG.Map.Tag) .. "' - markers kept, placing paused"
+        end
+    end
+    return true, ""
+end
+
+-- Ray that skips non-map things (players, NPCs, our own objects, invisible parts)
+function Map.raycast(origin, direction)
+    local params = RaycastParams.new()
+    params.FilterType = EXCLUDE
+    params.IgnoreWater = true
+    local ignore = {}
+    if World.folder then ignore[#ignore + 1] = World.folder end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.Character then ignore[#ignore + 1] = plr.Character end
+    end
+    for _ = 1, 12 do
+        params.FilterDescendantsInstances = ignore
+        local res = Workspace:Raycast(origin, direction, params)
+        if not res then return nil end
+        if Map.isMap(res.Instance) then return res end
+        ignore[#ignore + 1] = res.Instance
+    end
+    return nil
+end
+
+-- Find the map surface at a saved point (used on load and to re-attach)
+function Map.probe(pos, normal)
+    local n = normal
+    if n.Magnitude < 0.01 then n = Vector3.new(0, 1, 0) else n = n.Unit end
+    local res = Map.raycast(pos + n * 1.0, -n * 2.0)
+    if res and (res.Position - pos).Magnitude <= 0.8 then return res end
+    return nil
+end
+
+-- Is the marker still sitting on the surface it was bound to?
+function Map.stillOn(m)
+    local part = m.part
+    if not part or not part.Parent then return false end
+    local cf = part.CFrame
+    local pos = cf:PointToWorldSpace(m.localPos)
+    local n = cf:VectorToWorldSpace(m.localNormal)
+    local params = RaycastParams.new()
+    params.FilterType = INCLUDE
+    params.FilterDescendantsInstances = { part }
+    local res = Workspace:Raycast(pos + n * 0.4, -n * 1.0, params)
+    local tol = part:IsA("Terrain") and 1.5 or 0.5
+    return res ~= nil and (res.Position - pos).Magnitude <= tol
+end
+
+--==============================================================================
+-- 7. WORLD: parts, pins, discs, beam and arrow (all plain Instances)
+--==============================================================================
+World.folder = nil
+World.wp = nil
+
+function World.init()
+    local f = Instance.new("Folder")
+    f.Name = randomName()
+    f:SetAttribute(ATTR, true)
+    local ok = pcall(function() f.Parent = Workspace end)
+    if not ok or f.Parent ~= Workspace then
+        pcall(function() f:Destroy() end)
+        return false
+    end
+    World.folder = f
+    Main:Add(f)
+    return true
+end
+
+local function newPart(pos)
+    local p = Instance.new("Part")
+    p.Name = "a"
+    p.Anchored = true
+    p.CanCollide = false
+    p.CanTouch = false
+    p.CanQuery = false
+    p.CastShadow = false
+    p.Transparency = 1
+    p.Size = Vector3.new(0.2, 0.2, 0.2)
+    p.CFrame = CFrame.new(pos)
+    p.Parent = World.folder
+    return p
+end
+
+local function discCFrame(pos, normal)
+    local n = normal
+    if n.Magnitude < 0.01 then n = Vector3.new(0, 1, 0) else n = n.Unit end
+    local up = (math.abs(n.Y) > 0.99) and Vector3.new(0, 0, 1) or Vector3.new(0, 1, 0)
+    local at = pos + n * 0.07
+    -- cylinders extend along their X axis, so spin the look frame to put X on the normal
+    return CFrame.lookAt(at, at + n, up) * CFrame.Angles(0, math.pi / 2, 0)
+end
+
+function World.buildMarker(m)
+    local anchor = newPart(m.pos)
+
+    local disc = Instance.new("Part")
+    disc.Name = "d"
+    disc.Shape = Enum.PartType.Cylinder
+    disc.Size = Vector3.new(0.1, 1.8, 1.8)
+    disc.Anchored, disc.CanCollide, disc.CanTouch, disc.CanQuery, disc.CastShadow = true, false, false, false, false
+    disc.Material = Enum.Material.Neon
+    disc.Color = m.color
+    disc.Transparency = 0.3
+    disc.Parent = anchor
+
+    local gui = create("BillboardGui", {
+        Name = "p", Adornee = anchor, AlwaysOnTop = true, LightInfluence = 0, ResetOnSpawn = false,
+        Size = UDim2.fromOffset(130, 72),
+        StudsOffsetWorldSpace = Vector3.new(0, CONFIG.PinHeight, 0),
+    }, anchor)
+
+    local stroke = Color3.new(0, 0, 0)
+    local nameL = label(gui, {
+        Name = "n", Size = UDim2.new(1, 0, 0.3, 0), Position = UDim2.new(0, 0, 0, 0),
+        TextScaled = true, TextXAlignment = ALIGN_C, Font = FONT_BOLD,
+        TextStrokeTransparency = 0.45, TextStrokeColor3 = stroke,
+    })
+    local distL = label(gui, {
+        Name = "dd", Size = UDim2.new(1, 0, 0.22, 0), Position = UDim2.new(0, 0, 0.3, 0),
+        TextScaled = true, TextXAlignment = ALIGN_C, TextColor3 = m.color,
+        TextStrokeTransparency = 0.45, TextStrokeColor3 = stroke,
+    })
+    local icon = label(gui, {
+        Name = "i", Size = UDim2.new(1, 0, 0.48, 0), Position = UDim2.new(0, 0, 0.52, 0),
+        TextScaled = true, TextXAlignment = ALIGN_C, Font = FONT_BOLD, Text = CONFIG.Icon,
+        TextColor3 = m.color, TextStrokeTransparency = 0.45, TextStrokeColor3 = stroke,
+    })
+
+    m.anchor, m.disc, m.gui, m.nameL, m.distL, m.icon = anchor, disc, gui, nameL, distL, icon
+    m.fade = {
+        { nameL, "TextTransparency", 0 }, { nameL, "TextStrokeTransparency", 0.45 },
+        { distL, "TextTransparency", 0 }, { distL, "TextStrokeTransparency", 0.45 },
+        { icon, "TextTransparency", 0 },  { icon, "TextStrokeTransparency", 0.45 },
+    }
+    if CONFIG.IconImage ~= "" then
+        local img = create("ImageLabel", {
+            Name = "img", BackgroundTransparency = 1, Size = icon.Size, Position = icon.Position,
+            Image = CONFIG.IconImage, ImageColor3 = m.color, ScaleType = Enum.ScaleType.Fit,
+        }, gui)
+        m.img = img
+        m.fade[#m.fade + 1] = { img, "ImageTransparency", 0 }
+    end
+end
+
+function World.place(m)
+    if not m.anchor then return end
+    m.anchor.CFrame = CFrame.new(m.pos)
+    m.disc.CFrame = discCFrame(m.pos, m.normal)
+end
+
+-- Re-apply everything that depends on config / marker data
+function World.restyle(m)
+    if not m.gui then return end
+    local s = CONFIG.MarkerScale
+    local isActive = State.activeId == m.id
+    m.gui.Size = UDim2.fromOffset(130 * s, 72 * s)
+    m.gui.StudsOffsetWorldSpace = Vector3.new(0, CONFIG.PinHeight, 0)
+    m.icon.Text = (CONFIG.IconImage ~= "") and "" or CONFIG.Icon
+    m.icon.TextColor3 = m.color
+    m.distL.TextColor3 = m.color
+    m.disc.Color = m.color
+    if m.img then m.img.ImageColor3 = m.color end
+    m.nameL.Text = (isActive and (GLYPH.star .. " ") or "") .. m.name
+    m.nameL.TextColor3 = isActive and m.color or C.Text
+    local style = Markers.effectiveStyle(m)
+    m.gui.AlwaysOnTop = (style == "A") or CONFIG.ModeBThroughWalls
+        or (isActive and CONFIG.Waypoint.ForcePinVisible)
+    m.alpha = -1 -- force the fade to be re-applied on the next frame
+end
+
+function World.setAlpha(m, a)
+    if a == m.alpha then return end
+    if m.alpha >= 0 and a > 0 and a < 1 and math.abs(a - m.alpha) < 0.01 then return end
+    m.alpha = a
+    m.gui.Enabled = a < 0.995
+    m.disc.Transparency = 0.3 + 0.7 * a
+    for _, f in ipairs(m.fade) do
+        f[1][f[2]] = f[3] + (1 - f[3]) * a
+    end
+end
+
+function World.setMoving(id)
+    for _, m in ipairs(State.order) do
+        local want = (m.id == id)
+        if m.pulse and not want then World.restyle(m) end
+        m.pulse = want
+    end
+end
+
+function World.clearWaypoint()
+    local wp = World.wp
+    World.wp = nil
+    if not wp then return end
+    for _, inst in ipairs({ wp.origin, wp.a1, wp.arrowPart }) do
+        if inst then pcall(function() inst:Destroy() end) end
+    end
+end
+
+function World.setWaypoint(m)
+    World.clearWaypoint()
+    if not m or not m.anchor then return end
+    local wp = { marker = m }
+    local guide = CONFIG.Waypoint.Guide
+
+    if guide == "beam" or guide == "both" then
+        local origin = newPart(Vector3.new(0, 0, 0))
+        local a0 = create("Attachment", {}, origin)
+        local a1 = create("Attachment", { Position = Vector3.new(0, CONFIG.PinHeight, 0) }, m.anchor)
+        local w = CONFIG.Waypoint.BeamWidth
+        local beam = create("Beam", {
+            Attachment0 = a0, Attachment1 = a1, Color = ColorSequence.new(m.color),
+            LightEmission = 0.6, LightInfluence = 0, FaceCamera = true, Width0 = w, Width1 = w,
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.85), NumberSequenceKeypoint.new(0.1, 0.4),
+                NumberSequenceKeypoint.new(1, 0.25),
+            }),
+        }, origin)
+        if CONFIG.Waypoint.BeamTexture ~= "" then
+            beam.Texture = CONFIG.Waypoint.BeamTexture
+            beam.TextureMode = Enum.TextureMode.Wrap
+            beam.TextureLength = 3
+            beam.TextureSpeed = 1.5
+        end
+        wp.origin, wp.a1, wp.beam = origin, a1, beam
+    end
+
+    if guide == "arrow" or guide == "both" then
+        local part = newPart(Vector3.new(0, 0, 0))
+        local gui = create("BillboardGui", {
+            Adornee = part, AlwaysOnTop = true, LightInfluence = 0, ResetOnSpawn = false,
+            Size = UDim2.fromOffset(46, 46),
+        }, part)
+        local lbl = label(gui, {
+            Size = UDim2.fromScale(1, 1), TextScaled = true, TextXAlignment = ALIGN_C, Font = FONT_BOLD,
+            Text = GLYPH.arrow, TextColor3 = m.color, TextStrokeTransparency = 0.3,
+        })
+        wp.arrowPart, wp.arrowGui, wp.arrowLbl = part, gui, lbl
+    end
+
+    World.wp = wp
+end
+
+function World.refreshWaypoint()
+    World.setWaypoint(State.activeId and State.markers[State.activeId] or nil)
+end
+
+function World.stepWaypoint()
+    local wp = World.wp
+    if not wp then return end
+    local m = wp.marker
+    if not m.anchor or not m.anchor.Parent then return end
+    local root = getRoot()
+    if not root then
+        if wp.beam then wp.beam.Enabled = false end
+        if wp.arrowGui then wp.arrowGui.Enabled = false end
+        return
+    end
+    local from = root.Position
+    local target = m.pos + Vector3.new(0, CONFIG.PinHeight, 0)
+
+    if wp.beam then
+        wp.beam.Enabled = true
+        wp.origin.CFrame = CFrame.new(from - Vector3.new(0, 2, 0))
+        local w = CONFIG.Waypoint.BeamWidth * (0.85 + 0.15 * math.sin(os.clock() * 4))
+        wp.beam.Width0, wp.beam.Width1 = w, w
+    end
+
+    if wp.arrowPart then
+        local toTarget = target - from
+        local dist = toTarget.Magnitude
+        local hide = dist < CONFIG.Waypoint.ArriveDistance
+        wp.arrowGui.Enabled = not hide
+        if not hide then
+            local dir = toTarget / dist
+            wp.arrowPart.CFrame = CFrame.new(from + dir * CONFIG.Waypoint.ArrowDistance + Vector3.new(0, 1.5, 0))
+            local cam = Workspace.CurrentCamera
+            if cam then
+                local cd = cam.CFrame:VectorToObjectSpace(dir)
+                local sx, sy = cd.X, -cd.Y
+                if math.abs(sx) + math.abs(sy) > 0.05 then
+                    wp.arrowLbl.Rotation = math.deg(math.atan2(sy, sx)) + 90
+                end
+            end
+        end
+    end
+end
+
+--==============================================================================
+-- 8. MARKERS: create / bind / validate / remove
+--==============================================================================
+function Markers.effectiveStyle(m)
+    return m.style or CONFIG.MarkerStyle
+end
+
+function Markers.new(data)
+    local m = {
+        id = data.id or genId(), name = data.name, color = data.color, style = data.style,
+        pos = data.pos, normal = data.normal,
+        part = nil, localPos = nil, localNormal = nil, partCF = nil,
+        pending = data.pending or false, born = os.clock(), misses = 0, alpha = -1, dist = 0,
+    }
+    State.markers[m.id] = m
+    State.order[#State.order + 1] = m
+    World.buildMarker(m)
+    World.restyle(m)
+    World.place(m)
+    return m
+end
+
+-- Attach a marker to a surface: remember where it is in the part's local space
+function Markers.bind(m, part, pos, normal)
+    local n = normal
+    if n.Magnitude < 0.01 then n = Vector3.new(0, 1, 0) end
+    local cf = part.CFrame
+    m.part = part
+    m.localPos = cf:PointToObjectSpace(pos)
+    m.localNormal = cf:VectorToObjectSpace(n)
+    m.partCF = cf
+    m.pos, m.normal = pos, n
+    m.pending, m.misses = false, 0
+    World.place(m)
+end
+
+function Markers.createFromHit(res)
+    if #State.order >= CONFIG.MaxMarkers then
+        UI.toast("Marker limit reached (" .. CONFIG.MaxMarkers .. ")", "warn", 2.5)
+        return nil
+    end
+    State.counter = State.counter + 1
+    local pal = CONFIG.Palette
+    local color = CONFIG.CycleColors and pal[(State.counter - 1) % #pal + 1] or CONFIG.DefaultColor
+    local m = Markers.new({
+        name = CONFIG.NamePrefix .. " " .. State.counter, color = color,
+        pos = res.Position, normal = res.Normal,
+    })
+    Markers.bind(m, res.Instance, res.Position, res.Normal)
+    State.selectedId = m.id
+    UI.refreshList()
+    UI.refreshButtons()
+    UI.refreshStatus()
+    Store.markDirty()
+    UI.toast("Placed " .. m.name, "good", 1.5)
+    return m
+end
+
+function Markers.moveTo(m, res)
+    Markers.bind(m, res.Instance, res.Position, res.Normal)
+    if State.activeId == m.id then World.refreshWaypoint() end
+    UI.toast("Moved " .. m.name, "good", 1.5)
+    Store.markDirty()
+end
+
+function Markers.restore(entry)
+    local pos = arrToV3(entry.pos)
+    if not pos then return nil end
+    local normal = arrToV3(entry.normal) or Vector3.new(0, 1, 0)
+    local m = Markers.new({
+        id = (type(entry.id) == "string" and entry.id ~= "") and entry.id or nil,
+        name = (type(entry.name) == "string" and entry.name ~= "") and entry.name or "Marker",
+        color = arrToColor(entry.color, CONFIG.DefaultColor),
+        style = (entry.style == "A" or entry.style == "B") and entry.style or nil,
+        pos = pos, normal = normal, pending = true,
+    })
+    local res = Map.probe(pos, normal) -- the world may already be loaded
+    if res then Markers.bind(m, res.Instance, res.Position, res.Normal) end
+    return m
+end
+
+function Markers.remove(m, reason, silent)
+    if not m or not State.markers[m.id] then return end
+    State.markers[m.id] = nil
+    for i, v in ipairs(State.order) do
+        if v == m then table.remove(State.order, i) break end
+    end
+    if State.activeId == m.id then
+        State.activeId = nil
+        World.clearWaypoint()
+    end
+    if State.selectedId == m.id then State.selectedId = nil end
+    if State.movingId == m.id then Input.setMode("idle") end
+    if m.anchor then pcall(function() m.anchor:Destroy() end) end
+    if not silent then
+        UI.refreshList()
+        UI.refreshButtons()
+        UI.refreshStatus()
+        UI.refreshHudNow()
+        if reason then UI.toast(reason, "info", 2) end
+    end
+    Store.markDirty()
+end
+
+function Markers.clearAll()
+    local n = #State.order
+    for i = #State.order, 1, -1 do
+        local m = State.order[i]
+        if m.anchor then pcall(function() m.anchor:Destroy() end) end
+    end
+    World.clearWaypoint()
+    State.markers, State.order = {}, {}
+    State.selectedId, State.activeId, State.counter = nil, nil, 0
+    if State.mode ~= "idle" then Input.setMode("idle") end
+    UI.refreshList()
+    UI.refreshButtons()
+    UI.refreshStatus()
+    UI.refreshHudNow()
+    Store.markDirty()
+    UI.toast("Cleared " .. n .. " marker(s)", "info", 2)
+end
+
+function Markers.setActive(id)
+    State.activeId = id
+    State.arrived = false
+    for _, m in ipairs(State.order) do World.restyle(m) end
+    World.setWaypoint(id and State.markers[id] or nil)
+    UI.refreshList()
+    UI.refreshButtons()
+    UI.refreshHudNow()
+    Store.markDirty()
+end
+
+function Markers.rename(m, text)
+    text = trim(text)
+    if text == "" then return end
+    if #text > 24 then text = text:sub(1, 24) end
+    m.name = text
+    World.restyle(m)
+    UI.refreshList()
+    Store.markDirty()
+end
+
+function Markers.recolor(m, color)
+    m.color = color
+    World.restyle(m)
+    if State.activeId == m.id then World.refreshWaypoint() end
+    UI.refreshList()
+    Store.markDirty()
+end
+
+function Markers.setStyle(m, style) -- style: "A" | "B" | nil (= follow global)
+    m.style = style
+    World.restyle(m)
+    UI.refreshList()
+    Store.markDirty()
+end
+
+-- Per-frame: follow moving surfaces, fade by distance, pulse a marker being moved
+function Markers.step()
+    local focus = getFocusPos()
+    local t = os.clock()
+    for _, m in ipairs(State.order) do
+        local part = m.part
+        if part and part.Parent then
+            local cf = part.CFrame
+            if cf ~= m.partCF then
+                m.partCF = cf
+                m.pos = cf:PointToWorldSpace(m.localPos)
+                m.normal = cf:VectorToWorldSpace(m.localNormal)
+                World.place(m)
+            end
+        end
+        local d = (m.pos - focus).Magnitude
+        m.dist = d
+        local alpha = 0
+        local keepVisible = (State.activeId == m.id) and CONFIG.Waypoint.ForcePinVisible
+        if Markers.effectiveStyle(m) == "B" and not keepVisible then
+            local far = CONFIG.FadeDistance
+            local start = far * CONFIG.FadeStartFrac
+            if d >= far then
+                alpha = 1
+            elseif d > start then
+                alpha = (d - start) / math.max(0.001, far - start)
+            end
+        end
+        World.setAlpha(m, alpha)
+        if m.pulse then
+            local k = (1 + 0.18 * math.sin(t * 8)) * CONFIG.MarkerScale
+            m.gui.Size = UDim2.fromOffset(130 * k, 72 * k)
+        end
+    end
+end
+
+-- Periodic: is every marker still on a surface that counts as the map?
+function Markers.validate()
+    local ok, msg = Map.available()
+    State.mapMissing, State.mapMsg = not ok, msg
+    if not ok then UI.refreshStatus() return end
+    local now = os.clock()
+    if now < State.holdUntil then return end
+
+    local focus = getFocusPos()
+    local streaming = Workspace.StreamingEnabled
+    local removed = {}
+    for i = #State.order, 1, -1 do
+        local m = State.order[i]
+        local inRange = (not streaming) or ((m.pos - focus).Magnitude <= CONFIG.Map.ValidateRadius)
+        if inRange then
+            local good = false
+            if m.part and m.part.Parent and Map.isMap(m.part) and Map.stillOn(m) then
+                good = true
+            else
+                -- surface gone, replaced (streaming) or never resolved (fresh load): try to re-attach
+                local res = Map.probe(m.pos, m.normal)
+                if res then
+                    Markers.bind(m, res.Instance, res.Position, res.Normal)
+                    good = true
+                end
+            end
+            if good then
+                m.misses, m.pending = 0, false
+            else
+                m.misses = m.misses + 1
+                local grace = m.pending and CONFIG.Map.LoadGraceSeconds or 0
+                if m.misses >= 2 and (now - m.born) >= grace then
+                    removed[#removed + 1] = m
+                end
+            end
+        end
+    end
+    if #removed > 0 then
+        for _, m in ipairs(removed) do Markers.remove(m, nil, true) end
+        UI.refreshList()
+        UI.refreshButtons()
+        UI.refreshStatus()
+        UI.refreshHudNow()
+        UI.toast(#removed .. " marker(s) removed: their surface is gone", "warn", 3)
+    end
+end
+
+--==============================================================================
+-- 9. UI: HUD (pill, edge arrow, toasts) + draggable panel (actions, list, settings)
+--==============================================================================
+UI.built = false
+UI.refs = {}
+UI.page = "list"
+UI.scale = 1
+UI.HEADER_H = 44
+UI.FOOTER_H = 34   -- bottom strip: status text + resize grips
+UI.MIN_W, UI.MIN_H = 260, 240
+UI.BTN_H = math.max(44, CONFIG.UI.ButtonHeight)
+UI.toastUntil = 0
+UI.lpFired = false
+UI.refreshers = {}
+
+local function kindColor(kind)
+    if kind == "good" then return C.Good end
+    if kind == "warn" then return C.Warn end
+    if kind == "error" then return C.Danger end
+    return C.Accent
+end
+
+local function makeScreenGui(displayOrder, insetModes, forceIgnoreInset)
+    local gui = Instance.new("ScreenGui")
+    gui.Name = randomName()
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = displayOrder
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui:SetAttribute(ATTR, true)
+    local okInsets = false
+    for _, modeName in ipairs(insetModes) do
+        local ok = pcall(function() gui.ScreenInsets = Enum.ScreenInsets[modeName] end)
+        if ok then okInsets = true break end
+    end
+    -- IgnoreGuiInset and ScreenInsets are two views of one setting: writing
+    -- IgnoreGuiInset = true after a successful ScreenInsets write resets it to "None",
+    -- which put the panel under the topbar / notch. Only touch it when needed.
+    if forceIgnoreInset then
+        gui.IgnoreGuiInset = true
+    elseif not okInsets then
+        gui.IgnoreGuiInset = false
+    end
+    return gui
+end
+
+-- gethui() -> CoreGui -> PlayerGui
+local function parentGui(gui)
+    if Exec.protectgui then pcall(Exec.protectgui, gui) end
+    local getters = {}
+    if Exec.gethui then getters[#getters + 1] = function() return Exec.gethui() end end
+    getters[#getters + 1] = function() return game:GetService("CoreGui") end
+    getters[#getters + 1] = function() return LocalPlayer:WaitForChild("PlayerGui", 5) end
+    local names = { "gethui", "CoreGui", "PlayerGui" }
+    local startAt = Exec.gethui and 1 or 2
+    for i, getParent in ipairs(getters) do
+        local ok, parent = pcall(getParent)
+        if ok and typeof(parent) == "Instance" then
+            local okP = pcall(function() gui.Parent = parent end)
+            if okP and gui.Parent == parent then
+                return parent, names[startAt + i - 1]
+            end
+        end
+    end
+    return nil, nil
+end
+
+function UI.toast(text, kind, duration)
+    if not UI.built then warn("[WPM] " .. tostring(text)) return end
+    local r = UI.refs
+    r.toastLbl.Text = tostring(text)
+    r.toastStroke.Color = kindColor(kind)
+    r.toast.Visible = true
+    UI.toastUntil = os.clock() + (duration or 2.5)
+end
+
+function UI.build()
+    local hudGui = makeScreenGui(50, { "None" }, true)
+    local uiGui = makeScreenGui(60, { "None" }, true)
+    local p1, name1 = parentGui(hudGui)
+    local p2 = parentGui(uiGui)
+    if not p1 or not p2 then
+        pcall(function() hudGui:Destroy() end)
+        pcall(function() uiGui:Destroy() end)
+        return false
+    end
+    Main:Add(hudGui)
+    Main:Add(uiGui)
+    UI.parentName = name1 or "?"
+
+    local r = UI.refs
+    r.hudGui, r.uiGui = hudGui, uiGui
+
+    ---------------------------------------------------------------- HUD layer
+    local okI, inset = pcall(function() return GuiService:GetGuiInset() end)
+    UI.topInset = (okI and typeof(inset) == "Vector2") and inset.Y or 36
+
+    r.pill = create("Frame", {
+        Name = "Pill", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, UI.topInset + 6),
+        AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 34),
+        BackgroundColor3 = C.Panel, BackgroundTransparency = 0.12, BorderSizePixel = 0, Visible = false,
+    }, hudGui)
+    addCorner(r.pill, 17)
+    r.pillStroke = addStroke(r.pill, C.Accent, 2)
+    addPadding(r.pill, 14, 0, 14, 0)
+    r.pillLbl = label(r.pill, {
+        AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 34),
+        Font = FONT_BOLD, TextSize = 15,
+    })
+
+    r.toast = create("Frame", {
+        Name = "Toast", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, UI.topInset + 46),
+        AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 34),
+        BackgroundColor3 = C.Panel, BackgroundTransparency = 0.08, BorderSizePixel = 0, Visible = false,
+    }, hudGui)
+    addCorner(r.toast, 10)
+    r.toastStroke = addStroke(r.toast, C.Accent, 2)
+    addPadding(r.toast, 12, 0, 12, 0)
+    r.toastLbl = label(r.toast, {
+        AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 34), TextSize = 14,
+    })
+
+    r.banner = create("Frame", {
+        Name = "ModeBanner", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -18),
+        AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 58),
+        BackgroundColor3 = C.Panel, BackgroundTransparency = 0.05, BorderSizePixel = 0, Visible = false,
+    }, hudGui)
+    addCorner(r.banner, 12)
+    addStroke(r.banner, C.Accent, 2)
+    addPadding(r.banner, 10, 7, 7, 7)
+    create("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 10),
+        VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder,
+    }, r.banner)
+    r.bannerLbl = label(r.banner, {
+        AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 44), TextSize = 14, LayoutOrder = 1,
+    })
+    r.bannerCancel = button(r.banner, {
+        Text = "Cancel", Size = UDim2.fromOffset(88, 44), BackgroundColor3 = C.Danger, LayoutOrder = 2,
+    }, function() Input.setMode("idle") end)
+
+    r.edge = create("Frame", {
+        Name = "Edge", AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(44, 44),
+        BackgroundColor3 = C.Accent, BackgroundTransparency = 0.1, BorderSizePixel = 0, Visible = false,
+    }, hudGui)
+    addCorner(r.edge, 22)
+    addStroke(r.edge, Color3.new(1, 1, 1), 2)
+    r.edgeArrow = label(r.edge, {
+        Size = UDim2.fromScale(1, 1), TextXAlignment = ALIGN_C, Font = FONT_BOLD, TextSize = 24,
+        Text = GLYPH.arrow, TextColor3 = Color3.new(1, 1, 1),
+    })
+
+    r.reticle = label(hudGui, {
+        Name = "Reticle", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(30, 30), TextXAlignment = ALIGN_C, Font = FONT_BOLD, TextSize = 28,
+        Text = "+", TextColor3 = Color3.new(1, 1, 1), TextStrokeTransparency = 0.3, Visible = false,
+    })
+
+    ---------------------------------------------------------------- panel layer
+    r.scaler = create("Frame", {
+        Name = "Scaler", BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
+    }, uiGui)
+    r.uiScale = create("UIScale", { Scale = 1 }, r.scaler)
+
+    r.panel = create("Frame", {
+        Name = "Panel", BackgroundColor3 = C.Panel, BackgroundTransparency = 0.03, BorderSizePixel = 0,
+        Active = true, ClipsDescendants = true,
+        Size = UDim2.fromOffset(CONFIG.UI.PanelWidth, CONFIG.UI.PanelHeight), Position = UDim2.fromOffset(8, 8),
+    }, r.scaler)
+    addCorner(r.panel, 12)
+    addStroke(r.panel, C.Stroke, 1)
+
+    -- Header: drag handle + quick place + minimize + unload (all 44px targets)
+    r.header = create("Frame", {
+        Name = "Header", BackgroundColor3 = C.Header, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, UI.HEADER_H),
+    }, r.panel)
+    r.handle = create("Frame", {
+        Name = "Handle", BackgroundTransparency = 1, Active = true, Size = UDim2.new(1, -88, 1, 0),
+    }, r.header)
+    r.title = label(r.handle, {
+        Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -12, 1, 0), Text = "Markers",
+        Font = FONT_BOLD, TextSize = 16, TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+    r.unloadBtn = button(r.header, {
+        Text = GLYPH.close, Size = UDim2.fromOffset(44, 44), Position = UDim2.new(1, -44, 0, 0),
+        BackgroundTransparency = 1, TextSize = 18,
+    })
+    r.minBtn = button(r.header, {
+        Text = GLYPH.minimize, Size = UDim2.fromOffset(44, 44), Position = UDim2.new(1, -88, 0, 0),
+        BackgroundTransparency = 1, TextSize = 18,
+    }, function()
+        State.minimized = not State.minimized
+        UI.layout()
+        Store.markSettingsDirty()
+    end)
+    r.quickBtn = button(r.header, {
+        Text = "+", Size = UDim2.fromOffset(44, 44), Position = UDim2.new(1, -132, 0, 0),
+        BackgroundColor3 = C.Accent, TextSize = 22, Visible = false,
+    }, function() Input.onPlacePressed() end)
+
+    -- unload needs a second tap within 3 seconds (accidental-tap protection)
+    local unloadArmed = 0
+    Main:Connect(r.unloadBtn.Activated, function()
+        if os.clock() < unloadArmed then App.unload() return end
+        unloadArmed = os.clock() + 3
+        r.unloadBtn.BackgroundTransparency = 0
+        r.unloadBtn.BackgroundColor3 = C.Danger
+        UI.toast("Tap the X again to unload the script", "warn", 3)
+        task.delay(3.05, function()
+            if not State.unloaded and r.unloadBtn.Parent then
+                r.unloadBtn.BackgroundTransparency = 1
+            end
+        end)
+    end)
+
+    -- Dragging the panel by its header
+    local drag = nil
+    Main:Connect(r.handle.InputBegan, function(input)
+        local t = input.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+            drag = {
+                input = input, kind = t, moved = false,
+                start = Vector2.new(input.Position.X, input.Position.Y),
+                x0 = r.panel.Position.X.Offset, y0 = r.panel.Position.Y.Offset,
+            }
+        end
+    end)
+    Main:Connect(UserInputService.InputChanged, function(input)
+        if not drag then return end
+        local isMove = (drag.kind == Enum.UserInputType.Touch and input == drag.input)
+            or (drag.kind == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)
+        if not isMove then return end
+        local delta = (Vector2.new(input.Position.X, input.Position.Y) - drag.start) / UI.scale
+        if not drag.moved and delta.Magnitude < 5 then return end
+        drag.moved = true
+        local x, y = UI.clampPanel(drag.x0 + delta.X, drag.y0 + delta.Y)
+        r.panel.Position = UDim2.fromOffset(x, y)
+    end)
+    Main:Connect(UserInputService.InputEnded, function(input)
+        if not drag then return end
+        local done = (drag.kind == Enum.UserInputType.Touch and input == drag.input)
+            or (drag.kind == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)
+        if not done then return end
+        local moved = drag.moved
+        drag = nil
+        if moved then UI.storePosition() end
+    end)
+
+    -- Body
+    r.body = create("Frame", {
+        Name = "Body", BackgroundTransparency = 1, Position = UDim2.new(0, 0, 0, UI.HEADER_H),
+        Size = UDim2.new(1, 0, 1, -UI.HEADER_H),
+    }, r.panel)
+
+    r.actions = create("Frame", {
+        Name = "Actions", BackgroundTransparency = 1, Position = UDim2.new(0, 8, 0, 6),
+        Size = UDim2.new(1, -16, 0, UI.BTN_H),
+    }, r.body)
+    addList(r.actions, Enum.FillDirection.Horizontal, 4)
+
+    local function actionButton(text, order, onClick)
+        local b = button(r.actions, {
+            Text = text, Size = UDim2.new(0.25, -3, 1, 0), LayoutOrder = order, TextScaled = true,
+        }, onClick)
+        create("UITextSizeConstraint", { MaxTextSize = 14, MinTextSize = 10 }, b)
+        addPadding(b, 3, 3, 3, 3)
+        return b
+    end
+
+    r.placeBtn = actionButton("Place", 1, function() Input.onPlacePressed() end)
+    r.wpBtn = actionButton("Waypoint", 2, function()
+        local m = State.selectedId and State.markers[State.selectedId]
+        if not m then UI.toast("Select a marker in the list first", "warn", 2.5) return end
+        if State.activeId == m.id then
+            Markers.setActive(nil)
+            UI.toast("Waypoint cleared", "info", 2)
+        else
+            Markers.setActive(m.id)
+            UI.toast("Waypoint: " .. m.name, "good", 2)
+        end
+    end)
+    r.delBtn = actionButton("Delete", 3, function()
+        local m = State.selectedId and State.markers[State.selectedId]
+        if not m then UI.toast("Select a marker in the list first", "warn", 2.5) return end
+        Markers.remove(m, "Deleted " .. m.name)
+    end)
+    r.setBtn = actionButton("Settings", 4, function()
+        UI.setPage(UI.page == "settings" and "list" or "settings")
+    end)
+
+    r.pages = create("Frame", {
+        Name = "Pages", BackgroundTransparency = 1, ClipsDescendants = true,
+        Position = UDim2.new(0, 8, 0, UI.BTN_H + 12), Size = UDim2.new(1, -16, 1, -(UI.BTN_H + 12 + UI.FOOTER_H)),
+    }, r.body)
+
+    local function makeScroll(name)
+        local s = create("ScrollingFrame", {
+            Name = name, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
+            CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            ScrollBarThickness = 5, ScrollBarImageColor3 = C.Stroke, ScrollingDirection = Enum.ScrollingDirection.Y,
+        }, r.pages)
+        addList(s, nil, 6)
+        addPadding(s, 0, 0, 8, 6)
+        return s
+    end
+    r.listPage = makeScroll("List")
+    r.settingsPage = makeScroll("Settings")
+    r.settingsPage.Visible = false
+
+    r.status = label(r.body, {
+        Position = UDim2.new(0, 56, 1, -UI.FOOTER_H), Size = UDim2.new(1, -112, 0, UI.FOOTER_H), TextSize = 12,
+        TextColor3 = C.SubText, TextTruncate = Enum.TextTruncate.AtEnd, TextXAlignment = ALIGN_C,
+    })
+
+    -- Resize grips (bottom-left and bottom-right): drag to resize. The edge opposite the grip stays put.
+    local rs = nil
+    local function makeGrip(side)
+        local right = (side == "right")
+        local g = create("Frame", {
+            Name = "Grip" .. side, BackgroundTransparency = 1, Active = true, ZIndex = 5,
+            AnchorPoint = Vector2.new(right and 1 or 0, 1), Position = UDim2.new(right and 1 or 0, 0, 1, 0),
+            Size = UDim2.fromOffset(52, UI.FOOTER_H),
+        }, r.body)
+        for i, spec in ipairs({ { 6, 8 }, { 11, 16 }, { 16, 24 } }) do -- { offset from corner, line length }
+            local off = 8 + spec[1]
+            create("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = C.SubText, BorderSizePixel = 0,
+                Size = UDim2.fromOffset(spec[2], 2), Rotation = right and -45 or 45, ZIndex = 5,
+                Position = UDim2.new(right and 1 or 0, right and -off or off, 1, -off),
+            }, g)
+        end
+        Main:Connect(g.InputBegan, function(input)
+            local t = input.UserInputType
+            if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+                rs = {
+                    input = input, kind = t, right = right,
+                    start = Vector2.new(input.Position.X, input.Position.Y),
+                    x0 = r.panel.Position.X.Offset, y0 = r.panel.Position.Y.Offset,
+                    w0 = r.panel.Size.X.Offset, h0 = r.panel.Size.Y.Offset,
+                }
+            end
+        end)
+    end
+    makeGrip("left")
+    makeGrip("right")
+
+    Main:Connect(UserInputService.InputChanged, function(input)
+        if not rs then return end
+        local isMove = (rs.kind == Enum.UserInputType.Touch and input == rs.input)
+            or (rs.kind == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)
+        if not isMove then return end
+        local d = (Vector2.new(input.Position.X, input.Position.Y) - rs.start) / UI.scale
+        local aw, ah = UI.availSize()
+        local m = 8
+        local W, x
+        if rs.right then
+            W = math.clamp(rs.w0 + d.X, UI.MIN_W, math.max(UI.MIN_W, aw - rs.x0 - m))
+            x = rs.x0
+        else
+            W = math.clamp(rs.w0 - d.X, UI.MIN_W, math.max(UI.MIN_W, rs.x0 + rs.w0 - m))
+            x = rs.x0 + rs.w0 - W
+        end
+        local H = math.clamp(rs.h0 + d.Y, UI.MIN_H, math.max(UI.MIN_H, ah - rs.y0 - m))
+        r.panel.Size = UDim2.fromOffset(W, H)
+        r.panel.Position = UDim2.fromOffset(x, rs.y0)
+    end)
+    Main:Connect(UserInputService.InputEnded, function(input)
+        if not rs then return end
+        local done = (rs.kind == Enum.UserInputType.Touch and input == rs.input)
+            or (rs.kind == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)
+        if not done then return end
+        rs = nil
+        UI.userSized = true
+        CONFIG.UI.PanelWidth, CONFIG.UI.PanelHeight = r.panel.Size.X.Offset, r.panel.Size.Y.Offset
+        UI.storePosition() -- remembers position + size and re-applies layout
+    end)
+
+    UI.built = true
+    UI.buildSettings()
+    UI.layout()
+    UI.refreshAll()
+    return true
+end
+
+---------------------------------------------------------------------- layout
+-- The camera's ViewportSize is the real screen size; a ScreenGui's AbsoluteSize can report
+-- something much smaller on some executors (that squashed the panel to a few rows).
+function UI.viewport()
+    local cam = Workspace.CurrentCamera
+    if cam then
+        local v = cam.ViewportSize
+        if v.X >= 50 and v.Y >= 50 then return v end
+    end
+    return UI.refs.hudGui.AbsoluteSize
+end
+
+function UI.avoid(x, y, W, H, aw, ah)
+    if not (UserInputService.TouchEnabled and CONFIG.UI.AvoidRobloxButtons) then return x, y end
+    local s, m = UI.scale, 8
+    local zones = {
+        { right = true,  w = 150, h = 150 }, -- jump button
+        { right = false, w = 230, h = 210 }, -- thumbstick
+    }
+    for _ = 1, 2 do
+        for _, z in ipairs(zones) do
+            local zw, zh = z.w / s, z.h / s
+            local zx = z.right and (aw - zw) or 0
+            local zy = ah - zh
+            if x < zx + zw and x + W > zx and y < zy + zh and y + H > zy then
+                local upY = zy - H - 6
+                if upY >= m then
+                    y = upY
+                elseif z.right then
+                    if zx - W - 6 >= m then x = zx - W - 6 end
+                else
+                    if zx + zw + 6 + W <= aw - m then x = zx + zw + 6 end
+                end
+            end
+        end
+    end
+    return x, y
+end
+
+function UI.availSize()
+    local abs = UI.viewport()
+    return abs.X / UI.scale, abs.Y / UI.scale
+end
+
+function UI.clampPanel(x, y)
+    local r = UI.refs
+    local aw, ah = UI.availSize()
+    local W, H = r.panel.Size.X.Offset, r.panel.Size.Y.Offset
+    local m = 8
+    return math.clamp(x, m, math.max(m, aw - W - m)), math.clamp(y, m, math.max(m, ah - H - m))
+end
+
+function UI.storePosition()
+    local r = UI.refs
+    local aw, ah = UI.availSize()
+    local W, H = r.panel.Size.X.Offset, r.panel.Size.Y.Offset
+    local m = 8
+    local rx, ry = math.max(1, aw - W - 2 * m), math.max(1, ah - H - 2 * m)
+    CONFIG.UI.Position.X = math.clamp((r.panel.Position.X.Offset - m) / rx, 0, 1)
+    CONFIG.UI.Position.Y = math.clamp((r.panel.Position.Y.Offset - m) / ry, 0, 1)
+    Store.markSettingsDirty()
+    UI.layout() -- re-apply avoidance / clamping
+end
+
+function UI.layout()
+    local r = UI.refs
+    if not UI.built then return end
+    local vp = UI.viewport()
+    if vp.X < 50 or vp.Y < 50 then return end
+    -- never scale below 1 so touch targets stay >= 44px
+    local auto = math.clamp(math.min(vp.X, vp.Y) / 720, 1, 1.35)
+    local s = math.max(1, math.clamp(CONFIG.UI.Scale or 1, 1, 1.6) * auto)
+    UI.scale = s
+    r.uiScale.Scale = s
+    r.scaler.Size = UDim2.fromScale(1 / s, 1 / s)
+
+    local aw, ah = vp.X / s, vp.Y / s
+    local m = 8
+    local W, H
+    if State.minimized then
+        W, H = 244, UI.HEADER_H
+    else
+        W = math.clamp(CONFIG.UI.PanelWidth, UI.MIN_W, math.max(UI.MIN_W, aw - 2 * m))
+        -- until the user resizes, keep the panel to ~60% of the screen height so it doesn't swallow short phone screens
+        local wantH = UI.userSized and CONFIG.UI.PanelHeight or math.min(CONFIG.UI.PanelHeight, ah * 0.62)
+        H = math.clamp(wantH, UI.MIN_H, math.max(UI.MIN_H, ah - 2 * m))
+        H = math.min(H, math.max(120, ah - 2 * m))
+    end
+    W = math.min(W, math.max(120, aw - 2 * m))
+
+    local rx, ry = math.max(0, aw - W - 2 * m), math.max(0, ah - H - 2 * m)
+    local x = m + CONFIG.UI.Position.X * rx
+    local y = m + CONFIG.UI.Position.Y * ry
+    x, y = UI.avoid(x, y, W, H, aw, ah)
+
+    r.panel.Size = UDim2.fromOffset(W, H)
+    r.panel.Position = UDim2.fromOffset(x, y)
+    r.body.Visible = not State.minimized
+    r.quickBtn.Visible = State.minimized
+    r.handle.Size = UDim2.new(1, State.minimized and -132 or -88, 1, 0)
+    r.minBtn.Text = State.minimized and GLYPH.expand or GLYPH.minimize
+    UI.refreshTitle()
+    UI.lastVp = vp
+end
+
+function UI.setPage(page)
+    UI.page = page
+    local r = UI.refs
+    r.listPage.Visible = (page == "list")
+    r.settingsPage.Visible = (page == "settings")
+    UI.refreshButtons()
+    if page == "settings" then UI.refreshSettings() end
+end
+
+---------------------------------------------------------------------- refreshers
+function UI.refreshButtons()
+    if not UI.built then return end
+    local r = UI.refs
+    local armed = State.mode ~= "idle"
+    r.placeBtn.Text = armed and "Cancel" or "Place"
+    r.placeBtn.BackgroundColor3 = armed and C.Accent or C.Button
+    local sel = State.selectedId and State.markers[State.selectedId]
+    r.wpBtn.Text = (sel and State.activeId == sel.id) and "Unset" or "Waypoint"
+    r.wpBtn.BackgroundColor3 = (State.activeId ~= nil and sel and State.activeId == sel.id) and C.Good or C.Button
+    r.clearBtn.Text = "Clear all markers"
+    r.clearBtn.BackgroundColor3 = C.Button
+    r.setBtn.BackgroundColor3 = (UI.page == "settings") and C.Accent or C.Button
+    UI.refreshTitle()
+end
+
+function UI.refreshTitle()
+    if not UI.built then return end
+    local n = #State.order
+    -- shorter text when minimized so it never runs under the header buttons
+    UI.refs.title.Text = State.minimized and ("Markers " .. n) or ("Markers (" .. n .. ")")
+end
+
+function UI.refreshStatus()
+    if not UI.built then return end
+    local r = UI.refs
+    local text, color
+    if State.mapMissing then
+        text, color = State.mapMsg, C.Warn
+    elseif not Store.filesOK then
+        text, color = "Not saving: executor has no file access (memory only)", C.Warn
+    elseif not CONFIG.SaveEnabled then
+        text, color = "Auto-save is off", C.SubText
+    elseif Store.lastError then
+        text, color = "Save failed: " .. Store.lastError, C.Danger
+    else
+        text = string.format("%d/%d markers  %s  %s", #State.order, CONFIG.MaxMarkers, GLYPH.bullet,
+            Store.dirty and "saving..." or "saved")
+        color = C.SubText
+    end
+    r.status.Text, r.status.TextColor3 = text, color
+end
+
+function UI.refreshMode()
+    if not UI.built then return end
+    local r = UI.refs
+    if State.mode == "idle" then
+        r.banner.Visible = false
+    else
+        local m = State.movingId and State.markers[State.movingId]
+        if State.mode == "move" and m then
+            r.bannerLbl.Text = "Tap the map to move " .. m.name
+        else
+            r.bannerLbl.Text = "Tap the map to place a marker"
+        end
+        r.banner.Visible = true
+    end
+end
+
+function UI.refreshAll()
+    UI.refreshList()
+    UI.refreshButtons()
+    UI.refreshStatus()
+    UI.refreshMode()
+    UI.refreshSettings()
+end
+
+---------------------------------------------------------------------- marker list
+local function attachLongPress(gui, callback)
+    local pressed = nil
+    RowJan:Connect(gui.InputBegan, function(input)
+        local t = input.UserInputType
+        if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
+        UI.lpFired = false
+        local token = {}
+        pressed = token
+        local start = Vector2.new(input.Position.X, input.Position.Y)
+        task.delay(CONFIG.Input.LongPressTime, function()
+            if pressed ~= token or State.unloaded or not gui.Parent then return end
+            if t == Enum.UserInputType.Touch then
+                local cur = Vector2.new(input.Position.X, input.Position.Y)
+                if (cur - start).Magnitude > CONFIG.Input.TapMaxMove * 1.5 then return end -- it was a scroll
+            end
+            pressed = nil
+            UI.lpFired = true
+            callback()
+        end)
+    end)
+    RowJan:Connect(gui.InputEnded, function(input)
+        local t = input.UserInputType
+        if t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseButton1 then pressed = nil end
+    end)
+end
+
+local function buildRow(m, index)
+    local list = UI.refs.listPage
+    local selected = State.selectedId == m.id
+    local isActive = State.activeId == m.id
+
+    local row = create("Frame", {
+        Name = "Row", BackgroundColor3 = selected and C.RowSelected or C.Row, BorderSizePixel = 0,
+        AutomaticSize = Enum.AutomaticSize.Y, Size = UDim2.new(1, 0, 0, 0), LayoutOrder = index,
+    }, list)
+    addCorner(row, 8)
+    if selected then addStroke(row, m.color, 2) end
+    addList(row, nil, 0)
+
+    local head = create("TextButton", {
+        Name = "Head", Text = "", AutoButtonColor = false, BackgroundTransparency = 1, BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 48), LayoutOrder = 1,
+    }, row)
+    local dot = create("Frame", {
+        BackgroundColor3 = m.color, BorderSizePixel = 0, Size = UDim2.fromOffset(18, 18),
+        Position = UDim2.new(0, 12, 0.5, -9),
+    }, head)
+    addCorner(dot, 9)
+    label(head, {
+        Position = UDim2.new(0, 40, 0, 0), Size = UDim2.new(1, -132, 1, 0),
+        Text = (isActive and (GLYPH.star .. " ") or "") .. m.name,
+        TextTruncate = Enum.TextTruncate.AtEnd, Font = FONT_BOLD, TextSize = 15,
+    })
+    local distLbl = label(head, {
+        Position = UDim2.new(1, -92, 0, 0), Size = UDim2.new(0, 84, 1, 0), TextXAlignment = ALIGN_R,
+        TextColor3 = C.SubText, TextSize = 13, Text = formatDistance(m.dist or 0),
+    })
+    m.ui = { dist = distLbl }
+
+    RowJan:Connect(head.Activated, function()
+        if UI.lpFired then UI.lpFired = false return end -- that press was a long-press
+        State.selectedId = (State.selectedId == m.id) and nil or m.id
+        UI.refreshList()
+        UI.refreshButtons()
+    end)
+    attachLongPress(head, function() Input.beginMove(m) end)
+
+    if not selected then return end
+
+    -- Editor: rename, recolor, per-marker style, delete
+    local ed = create("Frame", {
+        Name = "Editor", BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.Y,
+        Size = UDim2.new(1, 0, 0, 0), LayoutOrder = 2,
+    }, row)
+    addPadding(ed, 8, 2, 8, 8)
+    addList(ed, nil, 6)
+
+    local box = create("TextBox", {
+        Name = "Rename", Text = m.name, PlaceholderText = "Marker name", ClearTextOnFocus = false,
+        BackgroundColor3 = C.Button, TextColor3 = C.Text, Font = FONT, TextSize = 15, BorderSizePixel = 0,
+        TextXAlignment = ALIGN_L, Size = UDim2.new(1, 0, 0, 44), LayoutOrder = 1,
+    }, ed)
+    addCorner(box, 8)
+    addPadding(box, 10, 0, 10, 0)
+    RowJan:Connect(box.FocusLost, function()
+        if trim(box.Text) == "" then box.Text = m.name return end
+        Markers.rename(m, box.Text)
+    end)
+
+    local sw = create("Frame", {
+        Name = "Swatches", BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.Y,
+        Size = UDim2.new(1, 0, 0, 0), LayoutOrder = 2,
+    }, ed)
+    create("UIGridLayout", {
+        CellSize = UDim2.new(0.25, -5, 0, 44), CellPadding = UDim2.fromOffset(6, 6),
+        FillDirectionMaxCells = 4, SortOrder = Enum.SortOrder.LayoutOrder,
+    }, sw)
+    for i, col in ipairs(CONFIG.Palette) do
+        local b = button(sw, { Text = "", BackgroundColor3 = col, LayoutOrder = i, AutoButtonColor = false },
+            function() Markers.recolor(m, col) end, RowJan)
+        if sameColor(col, m.color) then addStroke(b, Color3.new(1, 1, 1), 3) end
+    end
+
+    local styleRow = create("Frame", {
+        Name = "Style", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 44), LayoutOrder = 3,
+    }, ed)
+    addList(styleRow, Enum.FillDirection.Horizontal, 6)
+    local styleOpts = { { "G", "Global" }, { "A", "Always" }, { "B", "Near" } }
+    for i, opt in ipairs(styleOpts) do
+        local current = (opt[1] == "G" and m.style == nil) or (opt[1] == m.style)
+        button(styleRow, {
+            Text = opt[2], Size = UDim2.new(1 / 3, -4, 1, 0), LayoutOrder = i,
+            BackgroundColor3 = current and C.Accent or C.Button, TextSize = 13,
+        }, function()
+            Markers.setStyle(m, opt[1] ~= "G" and opt[1] or nil)
+        end, RowJan)
+    end
+
+    button(ed, {
+        Text = "Delete marker", BackgroundColor3 = C.Danger, Size = UDim2.new(1, 0, 0, 44), LayoutOrder = 4,
+    }, function() Markers.remove(m, "Deleted " .. m.name) end, RowJan)
+
+    label(ed, {
+        Text = "Tip: long-press a marker (here, or its pin in the world) to move it.",
+        TextWrapped = true, TextSize = 12, TextColor3 = C.SubText, LayoutOrder = 5,
+        AutomaticSize = Enum.AutomaticSize.Y, Size = UDim2.new(1, 0, 0, 0),
+    })
+end
+
+function UI.refreshList()
+    if not UI.built then return end
+    local list = UI.refs.listPage
+    local keepY = list.CanvasPosition
+    RowJan:Clean()
+    for _, child in ipairs(list:GetChildren()) do
+        if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then child:Destroy() end
+    end
+    for i, m in ipairs(State.order) do
+        buildRow(m, i)
+    end
+    if #State.order == 0 then
+        label(list, {
+            Text = "No markers yet.\nTap Place, then tap the map.", TextWrapped = true, TextSize = 14,
+            TextColor3 = C.SubText, TextXAlignment = ALIGN_C, Size = UDim2.new(1, 0, 0, 80),
+        })
+    end
+    pcall(function()
+        task.defer(function()
+            if list.Parent then list.CanvasPosition = keepY end
+        end)
+    end)
+end
+
+---------------------------------------------------------------------- settings page
+function UI.buildSettings()
+    local page = UI.refs.settingsPage
+    UI.refreshers = {}
+    local order = 0
+    local function nextOrder() order = order + 1 return order end
+
+    -- width of the control on the right of each row (+ margins) decides how much room the label gets
+    local CONTROL_W = { toggle = 82, stepper = 146, choice = 146, text = 146 }
+    local function newRow(text, kind)
+        local row = create("Frame", {
+            BackgroundColor3 = C.Row, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 56), LayoutOrder = nextOrder(),
+        }, page)
+        addCorner(row, 8)
+        label(row, {
+            Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -(12 + (CONTROL_W[kind] or 152) + 6), 1, 0),
+            Text = text, TextWrapped = true, TextSize = 13, TextYAlignment = Enum.TextYAlignment.Center,
+        })
+        return row
+    end
+
+    for _, entry in ipairs(SCHEMA) do
+        local row = newRow(entry.label, entry.kind)
+        local refresh
+
+        if entry.kind == "toggle" then
+            local btn = button(row, {
+                Size = UDim2.fromOffset(72, 44), Position = UDim2.new(1, -80, 0.5, -22),
+            }, function()
+                cfgSet(entry.path, not cfgGet(entry.path))
+                App.onConfigChanged(entry)
+            end)
+            refresh = function()
+                local v = cfgGet(entry.path)
+                btn.Text = v and "ON" or "OFF"
+                btn.BackgroundColor3 = v and C.Good or C.Button
+            end
+
+        elseif entry.kind == "stepper" then
+            local function bump(dir)
+                local v = round3(cfgGet(entry.path) + dir * entry.step)
+                cfgSet(entry.path, math.clamp(v, entry.min, entry.max))
+                App.onConfigChanged(entry)
+            end
+            button(row, {
+                Text = "-", TextSize = 22, Size = UDim2.fromOffset(44, 44), Position = UDim2.new(1, -144, 0.5, -22),
+            }, function() bump(-1) end)
+            local val = label(row, {
+                Size = UDim2.fromOffset(52, 44), Position = UDim2.new(1, -100, 0.5, -22),
+                TextXAlignment = ALIGN_C, Font = FONT_BOLD, TextSize = 14,
+            })
+            button(row, {
+                Text = "+", TextSize = 22, Size = UDim2.fromOffset(44, 44), Position = UDim2.new(1, -48, 0.5, -22),
+            }, function() bump(1) end)
+            refresh = function()
+                local v = cfgGet(entry.path)
+                val.Text = (v == math.floor(v)) and tostring(v) or string.format("%.1f", v)
+            end
+
+        elseif entry.kind == "choice" then
+            local function index()
+                local cur = cfgGet(entry.path)
+                for i, o in ipairs(entry.options) do
+                    if o[1] == cur then return i end
+                end
+                return 1
+            end
+            local btn = button(row, {
+                Size = UDim2.fromOffset(136, 44), Position = UDim2.new(1, -144, 0.5, -22), TextSize = 12,
+            }, function()
+                local nextI = index() % #entry.options + 1
+                cfgSet(entry.path, entry.options[nextI][1])
+                App.onConfigChanged(entry)
+            end)
+            refresh = function() btn.Text = entry.options[index()][2] end
+
+        elseif entry.kind == "text" then
+            local box = create("TextBox", {
+                Size = UDim2.fromOffset(136, 44), Position = UDim2.new(1, -144, 0.5, -22),
+                BackgroundColor3 = C.Button, TextColor3 = C.Text, PlaceholderText = "text",
+                ClearTextOnFocus = false, Font = FONT, TextSize = 13, BorderSizePixel = 0,
+            }, row)
+            addCorner(box, 8)
+            addPadding(box, 8, 0, 8, 0)
+            Main:Connect(box.FocusLost, function()
+                cfgSet(entry.path, trim(box.Text))
+                App.onConfigChanged(entry)
+            end)
+            refresh = function() box.Text = tostring(cfgGet(entry.path)) end
+        end
+
+        UI.refreshers[#UI.refreshers + 1] = refresh
+    end
+
+    local function wideButton(text, color, onClick)
+        local b = button(page, {
+            Text = text, BackgroundColor3 = color, Size = UDim2.new(1, 0, 0, 48), LayoutOrder = nextOrder(),
+            TextWrapped = true, TextSize = 14,
+        }, onClick)
+        addPadding(b, 10, 4, 10, 4)
+        return b
+    end
+    wideButton("Make every marker follow the global style", C.Button, function()
+        for _, m in ipairs(State.order) do m.style = nil end
+        App.onConfigChanged(nil)
+        UI.refreshList()
+        Store.markDirty()
+        UI.toast("Per-marker styles reset", "info", 2)
+    end)
+    local clearArmed = 0
+    UI.refs.clearBtn = wideButton("Clear all markers", C.Button, function()
+        local r = UI.refs
+        if #State.order == 0 then UI.toast("Nothing to clear", "info", 1.5) return end
+        if os.clock() < clearArmed then
+            clearArmed = 0
+            Markers.clearAll()
+            UI.refreshButtons()
+            return
+        end
+        clearArmed = os.clock() + 3
+        r.clearBtn.Text = "Tap again to confirm"
+        r.clearBtn.BackgroundColor3 = C.Danger
+        task.delay(3.05, function()
+            if not State.unloaded and r.clearBtn.Parent then UI.refreshButtons() end
+        end)
+    end)
+    wideButton("Reset settings to defaults", C.Danger, function()
+        for path, v in pairs(DEFAULTS) do cfgSet(path, v) end
+        CONFIG.UI.PanelWidth, CONFIG.UI.PanelHeight = 340, 460
+        UI.userSized = false
+        App.onConfigChanged({ map = true })
+        UI.toast("Settings reset", "info", 2)
+    end)
+
+    local info = label(page, {
+        Text = string.format(
+            "UI parent: %s\nFile access: %s\nSaving to: %s\nPlaceId: %s",
+            tostring(UI.parentName), Store.filesOK and "yes" or "NO (memory only)",
+            Store.filesOK and Store.path(markersFile()) or "-", tostring(game.PlaceId)),
+        TextWrapped = true, TextSize = 12, TextColor3 = C.SubText, LayoutOrder = nextOrder(),
+        AutomaticSize = Enum.AutomaticSize.Y, Size = UDim2.new(1, 0, 0, 0),
+    })
+    UI.refreshers[#UI.refreshers + 1] = function()
+        info.Text = string.format(
+            "UI parent: %s\nFile access: %s\nSaving to: %s\nPlaceId: %s",
+            tostring(UI.parentName), Store.filesOK and "yes" or "NO (memory only)",
+            Store.filesOK and Store.path(markersFile()) or "-", tostring(game.PlaceId))
+    end
+end
+
+function UI.refreshSettings()
+    for _, fn in ipairs(UI.refreshers) do pcall(fn) end
+end
+
+---------------------------------------------------------------------- HUD updates
+local function edgePoint(center, dir, left, top, right, bottom)
+    local tx, ty = math.huge, math.huge
+    if dir.X > 0 then tx = (right - center.X) / dir.X elseif dir.X < 0 then tx = (left - center.X) / dir.X end
+    if dir.Y > 0 then ty = (bottom - center.Y) / dir.Y elseif dir.Y < 0 then ty = (top - center.Y) / dir.Y end
+    return center + dir * math.min(tx, ty)
+end
+
+-- text that changes slowly (called a few times per second)
+function UI.refreshHudNow()
+    if not UI.built then return end
+    local r = UI.refs
+    local m = State.activeId and State.markers[State.activeId]
+    if not m then
+        r.pill.Visible = false
+        r.edge.Visible = false
+        return
+    end
+    r.pill.Visible = true
+    r.pillStroke.Color = m.color
+    r.pillLbl.Text = GLYPH.star .. " " .. m.name .. "  " .. GLYPH.bullet .. "  " .. formatDistance(m.dist or 0)
+    r.edge.BackgroundColor3 = m.color
+end
+
+function UI.updateTexts()
+    if not UI.built then return end
+    for _, m in ipairs(State.order) do
+        local text = formatDistance(m.dist)
+        if m.distL then m.distL.Text = text end
+        if m.ui and m.ui.dist and m.ui.dist.Parent then m.ui.dist.Text = text end
+    end
+    UI.refreshHudNow()
+end
+
+-- per-frame: edge indicator, toast timeout, reticle, viewport changes
+function UI.stepHud()
+    if not UI.built then return end
+    local r = UI.refs
+    local now = os.clock()
+    if r.toast.Visible and now >= UI.toastUntil then r.toast.Visible = false end
+    r.reticle.Visible = CONFIG.Input.GamepadReticle and Input.usingGamepad()
+
+    if UI.viewport() ~= UI.lastVp then
+        UI.layout()
+    end
+
+    local m = State.activeId and State.markers[State.activeId]
+    local cam = Workspace.CurrentCamera
+    if not m or not cam or not CONFIG.Waypoint.EdgeIndicator then
+        r.edge.Visible = false
+        return
+    end
+    local target = m.pos + Vector3.new(0, CONFIG.PinHeight, 0)
+    local v, onScreen = cam:WorldToViewportPoint(target)
+    local size = r.hudGui.AbsoluteSize
+    local touch = UserInputService.TouchEnabled
+    local mx = 14 + (touch and 40 or 0)
+    local half = 22
+    local left, right = mx + half, size.X - mx - half
+    local top, bottom = UI.topInset + 14 + half, size.Y - 14 - (touch and 30 or 0) - half
+    local p = Vector2.new(v.X, v.Y)
+    if onScreen and p.X >= left and p.X <= right and p.Y >= top and p.Y <= bottom then
+        r.edge.Visible = false
+        return
+    end
+    local center = Vector2.new(size.X / 2, size.Y / 2)
+    local dir = p - center
+    if v.Z < 0 then dir = -dir end -- behind the camera: the projection is mirrored
+    if dir.Magnitude < 1 then dir = Vector2.new(0, 1) end
+    local pt = edgePoint(center, dir, left, top, right, bottom)
+    r.edge.Position = UDim2.fromOffset(pt.X, pt.Y)
+    r.edge.Rotation = math.deg(math.atan2(dir.Y, dir.X)) + 90
+    r.edge.Visible = true
+end
+
+function UI.focusGamepad()
+    if not UI.built then return end
+    if State.minimized then
+        State.minimized = false
+        UI.layout()
+    end
+    pcall(function()
+        if GuiService.SelectedObject then
+            GuiService.SelectedObject = nil
+        else
+            GuiService.SelectedObject = UI.refs.placeBtn
+        end
+    end)
+end
+
+--==============================================================================
+-- 10. INPUT: clean taps, long-press grab, hotkeys, gamepad
+--==============================================================================
+Input.touches = {}   -- touch InputObject -> press record
+Input.mouseRec = nil -- press record for the left mouse button
+
+function Input.usingGamepad()
+    local t = State.lastInput
+    return t ~= nil and string.find(t.Name, "Gamepad") ~= nil
+end
+
+function Input.setMode(mode, markerId)
+    State.mode = mode
+    State.movingId = markerId
+    World.setMoving(markerId)
+    UI.refreshMode()
+    UI.refreshButtons()
+end
+
+function Input.beginMove(m)
+    if not m or not State.markers[m.id] then return end
+    State.selectedId = m.id
+    Input.setMode("move", m.id)
+    UI.refreshList()
+    UI.toast("Moving " .. m.name .. " - tap the map to drop it", "info", 3)
+end
+
+-- Place button / quick-place: arm placing (touch, mouse) or drop at the crosshair (gamepad)
+function Input.onPlacePressed()
+    if Input.usingGamepad() then
+        Input.commitCrosshair()
+        return
+    end
+    if State.mode ~= "idle" then
+        Input.setMode("idle")
+        return
+    end
+    local ok, msg = Map.available()
+    if not ok then UI.toast(msg, "warn", 4) return end
+    if #State.order >= CONFIG.MaxMarkers then
+        UI.toast("Marker limit reached (" .. CONFIG.MaxMarkers .. ")", "warn", 2.5)
+        return
+    end
+    Input.setMode("place")
+end
+
+function Input.screenToHit(x, y, viewportSpace)
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local ray = viewportSpace and cam:ViewportPointToRay(x, y) or cam:ScreenPointToRay(x, y)
+    return Map.raycast(ray.Origin, ray.Direction * CONFIG.Map.MaxPlaceDistance)
+end
+
+-- A confirmed spot on screen: place a new marker, or drop the one being moved
+function Input.commit(x, y, viewportSpace)
+    local ok, msg = Map.available()
+    if not ok then UI.toast(msg, "warn", 4) return end
+    local res = Input.screenToHit(x, y, viewportSpace)
+    if not res then UI.toast("No map surface there", "warn", 2) return end
+    if State.mode == "move" then
+        local m = State.movingId and State.markers[State.movingId]
+        if m then Markers.moveTo(m, res) end
+        Input.setMode("idle")
+    else
+        local m = Markers.createFromHit(res)
+        if m and not (CONFIG.Input.StickyPlace and State.mode == "place") then
+            Input.setMode("idle")
+        end
+    end
+end
+
+function Input.commitCrosshair()
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local vs = cam.ViewportSize
+    Input.commit(vs.X / 2, vs.Y / 2, true)
+end
+
+function Input.handleTap(rec)
+    if State.mode == "place" or State.mode == "move" then
+        Input.commit(rec.start.X, rec.start.Y, false)
+    end
+end
+
+local function nearestMarkerOnScreen(pos)
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local best, bestD = nil, CONFIG.Input.GrabRadius
+    for _, m in ipairs(State.order) do
+        if m.gui and m.gui.Enabled then
+            for _, world in ipairs({ m.pos + Vector3.new(0, CONFIG.PinHeight, 0), m.pos }) do
+                local sp, on = cam:WorldToScreenPoint(world)
+                if on then
+                    local d = (Vector2.new(sp.X, sp.Y) - pos).Magnitude
+                    if d < bestD then best, bestD = m, d end
+                end
+            end
+        end
+    end
+    return best
+end
+
+function Input.onBegan(input, gameProcessed)
+    if State.unloaded then return end
+    local t = input.UserInputType
+
+    if t == Enum.UserInputType.Keyboard then
+        if gameProcessed or UserInputService:GetFocusedTextBox() then return end
+        if input.KeyCode == CONFIG.Input.PlaceKey then
+            local mp = UserInputService:GetMouseLocation()
+            Input.commit(mp.X, mp.Y, true)
+        elseif input.KeyCode == CONFIG.Input.ToggleKey then
+            State.minimized = not State.minimized
+            UI.layout()
+            Store.markSettingsDirty()
+        end
+        return
+    end
+
+    if string.find(t.Name, "Gamepad") then
+        if input.KeyCode == CONFIG.Input.GamepadPlaceKey then
+            Input.commitCrosshair()
+        elseif input.KeyCode == CONFIG.Input.GamepadMenuKey then
+            UI.focusGamepad()
+        end
+        return
+    end
+
+    if t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseButton1 then
+        if gameProcessed then return end -- the press landed on a GUI (ours or Roblox's)
+        local rec = {
+            input = input, start = Vector2.new(input.Position.X, input.Position.Y), t = os.clock(),
+            moved = false, cancelled = false, consumed = false,
+        }
+        if t == Enum.UserInputType.Touch then
+            local others = false
+            for _, r in pairs(Input.touches) do r.cancelled = true others = true end
+            if others then rec.cancelled = true end -- second finger = pinch / multi-touch, never a tap
+            Input.touches[input] = rec
+        else
+            Input.mouseRec = rec
+        end
+    end
+end
+
+function Input.onChanged(input)
+    local t = input.UserInputType
+    local rec
+    if t == Enum.UserInputType.Touch then
+        rec = Input.touches[input]
+    elseif t == Enum.UserInputType.MouseMovement then
+        rec = Input.mouseRec
+    end
+    if rec and not rec.moved then
+        local cur = Vector2.new(input.Position.X, input.Position.Y)
+        if (cur - rec.start).Magnitude > CONFIG.Input.TapMaxMove then rec.moved = true end
+    end
+end
+
+function Input.onEnded(input)
+    local t = input.UserInputType
+    local rec
+    if t == Enum.UserInputType.Touch then
+        rec = Input.touches[input]
+        Input.touches[input] = nil
+    elseif t == Enum.UserInputType.MouseButton1 then
+        rec = Input.mouseRec
+        Input.mouseRec = nil
+    end
+    if not rec or rec.cancelled or rec.moved or rec.consumed then return end
+    if os.clock() - rec.t > CONFIG.Input.TapMaxTime then return end
+    local endPos = Vector2.new(input.Position.X, input.Position.Y)
+    if (endPos - rec.start).Magnitude > CONFIG.Input.TapMaxMove then return end
+    Input.handleTap(rec)
+end
+
+-- Long-press on a world pin picks that marker up (then a clean tap drops it)
+function Input.stepLongPress(now)
+    local function check(rec)
+        if not rec or rec.moved or rec.cancelled or rec.consumed then return end
+        if now - rec.t < CONFIG.Input.LongPressTime or State.mode == "place" then return end
+        local m = nearestMarkerOnScreen(rec.start)
+        if m then
+            rec.consumed = true
+            Input.beginMove(m)
+        end
+    end
+    for key, rec in pairs(Input.touches) do
+        if now - rec.t > 8 then Input.touches[key] = nil else check(rec) end -- drop stale records
+    end
+    check(Input.mouseRec)
+end
+
+function Input.start()
+    Main:Connect(UserInputService.InputBegan, Input.onBegan)
+    Main:Connect(UserInputService.InputChanged, Input.onChanged)
+    Main:Connect(UserInputService.InputEnded, Input.onEnded)
+    Main:Connect(UserInputService.LastInputTypeChanged, function(t) State.lastInput = t end)
+end
+
+--==============================================================================
+-- 11. APP: config changes, main loop, start, unload
+--==============================================================================
+function App.onConfigChanged(entry)
+    for _, m in ipairs(State.order) do World.restyle(m) end
+    World.refreshWaypoint()
+    if entry and entry.map then
+        State.holdUntil = os.clock() + 4
+        UI.toast("Map rule changed: markers off the new map vanish in a few seconds", "warn", 4)
+    end
+    UI.layout()
+    UI.refreshList()
+    UI.refreshStatus()
+    UI.refreshSettings()
+    UI.refreshHudNow()
+    Store.markSettingsDirty()
+    if entry and entry.path == "SaveEnabled" and CONFIG.SaveEnabled then Store.markDirty() end
+end
+
+local textAcc, validateAcc, warned = 0, 0, false
+
+function App.step(dt)
+    if State.unloaded then return end
+    local now = os.clock()
+
+    Markers.step()
+    World.stepWaypoint()
+    UI.stepHud()
+    Input.stepLongPress(now)
+
+    textAcc = textAcc + dt
+    if textAcc >= 0.25 then
+        textAcc = 0
+        UI.updateTexts()
+        local m = State.activeId and State.markers[State.activeId]
+        if m then
+            local arrive = CONFIG.Waypoint.ArriveDistance
+            if m.dist <= arrive then
+                if not State.arrived then
+                    State.arrived = true
+                    UI.toast("Arrived: " .. m.name, "good", 3)
+                    if CONFIG.Waypoint.AutoClearOnArrive then Markers.setActive(nil) end
+                end
+            elseif m.dist > arrive * 1.5 then
+                State.arrived = false
+            end
+        end
+    end
+
+    validateAcc = validateAcc + dt
+    if validateAcc >= CONFIG.Map.ValidateInterval then
+        validateAcc = 0
+        Markers.validate()
+    end
+
+    Store.tick(now)
+end
+
+function App.unload()
+    if State.unloaded then return end
+    State.unloaded = true
+    pcall(Store.flush)                       -- one last save
+    pcall(function()
+        if GuiService.SelectedObject and UI.refs.uiGui and GuiService.SelectedObject:IsDescendantOf(UI.refs.uiGui) then
+            GuiService.SelectedObject = nil
+        end
+    end)
+    Main:Destroy()                           -- disconnects every connection, destroys every Instance
+    UI.built = false
+    if Shared[SHARED_KEY] and Shared[SHARED_KEY].Unload == App.unload then
+        Shared[SHARED_KEY] = nil
+    end
+end
+
+function App.start()
+    sweepOrphans()
+    Store.init()
+    Store.loadSettings()
+
+    if not World.init() then
+        warn("[WPM] Could not create the world folder - aborting.")
+        State.unloaded = true
+        Main:Destroy()
+        return
+    end
+    if not UI.build() then
+        warn("[WPM] Could not parent the UI to gethui / CoreGui / PlayerGui - aborting.")
+        App.unload()
+        return
+    end
+
+    Shared[SHARED_KEY] = { Unload = App.unload, Version = 1 }
+    Input.start()
+
+    Main:Connect(RunService.RenderStepped, function(dt)
+        local ok, err = pcall(App.step, dt)
+        if not ok and not warned then
+            warned = true
+            warn("[WPM] step error (further errors hidden): " .. tostring(err))
+        end
+    end)
+
+    if not Store.filesOK then
+        UI.toast("No file access in this executor: markers will NOT be saved", "warn", 7)
+    end
+    Store.loadMarkers()
+    UI.refreshAll()
+    UI.refreshHudNow()
+end
+
+App.start()
